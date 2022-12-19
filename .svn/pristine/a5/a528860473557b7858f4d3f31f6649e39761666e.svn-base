@@ -1,0 +1,717 @@
+
+#include "charger_process.h"
+#include "mp2762a_drv.h"
+#include "solar_mppt.h"
+#include "user.h"
+
+#define CHARGER_DEBUG  1//1
+#if CHARGER_DEBUG
+#define charger_printf(...) pf_log_raw(atel_log_ctl.platform_en, ##__VA_ARGS__)
+#else
+#define charger_printf(...) 
+#endif
+
+static uint32_t count_recharge_check = 0;     // count for restarting charge check
+static uint32_t count_not_recharge_check = 0; // count for not restarting charge check
+static bool recharge_start = false;           // restarting charge check
+static uint32_t count_solar_p = 0;            // count for solar power
+static double sum_solar_p = 0.0;              // sum for solar power of SOLAR_GET_POWER_COUNT
+static double aver_solar_p = 0.0;             // average for solar power of SOLAR_GET_POWER_COUNT
+
+// Get Nordic chip temperature. Unit in Celsius Degree.
+int32_t chip_temp_get(void)
+{
+#if 0 // When there is no SoftDevice
+    int32_t temp = 0;
+
+    nrf_temp_init();
+    NRF_TEMP->TASKS_START = 1; /** Start the temperature measurement. */
+    /* Busy wait while temperature measurement is not finished, you can skip waiting if you enable interrupt for DATARDY event and read the result in the interrupt. */
+    /*lint -e{845} // A zero has been given as right argument to operator '|'" */
+    while (NRF_TEMP->EVENTS_DATARDY == 0)
+    { /* Do nothing. */ };
+    NRF_TEMP->EVENTS_DATARDY = 0;
+    temp = (nrf_temp_read() / 4);	// nrf_temp_read() output unit is in 0.25 Celsius degree.
+    NRF_TEMP->TASKS_STOP = 1; /** Stop the temperature measurement. */
+    return temp;
+#else // When there is SoftDevice
+    int32_t temp = 0;
+    sd_temp_get(&temp); // Temperature in 0.25 degrees Celsius
+    return (temp / 4);
+#endif
+}
+
+bool no_external_power(void)
+{
+    uint16_t vol_main = 0, vol_solar = 0;
+    bool result = 0;
+
+    vol_main = PF_ADC_RAW_TO_VIN_MV(monet_data.AdcMain);
+    vol_solar = PF_ADC_RAW_TO_VSIN_MV(monet_data.AdcSolar);
+    result = (vol_main < MAIN_ADC_MAIN_VALID &&
+              //vol_solar < SOLAR_ADC_VALID); // There is no external power supply
+              vol_solar < MAIN_ADC_MAIN_VALID);
+    return result;
+}
+
+bool only_solar_power(void)
+{
+    uint16_t vol_main = 0, vol_solar = 0;
+    bool result = 0;
+
+    vol_main = PF_ADC_RAW_TO_VIN_MV(monet_data.AdcMain);
+    vol_solar = PF_ADC_RAW_TO_VSIN_MV(monet_data.AdcSolar);
+    result = (vol_main < MAIN_ADC_MAIN_VALID &&
+              //vol_solar >= SOLAR_ADC_VALID); // Only solar power
+               vol_solar > MAIN_ADC_MAIN_VALID);
+    return result;
+}
+
+//Obtain the value of solar power for SOLAR_GET_POWER_COUNT times, and then calculate the average value
+//return   1----solar charger is invalid
+//return   0----solar charger is valid
+bool solar_charge_invalid(void)
+{
+    bool result = 0;
+
+    count_solar_p++;
+    if (count_solar_p % (SOLAR_GET_POWER_COUNT + 1) == 0)
+    {
+        aver_solar_p = sum_solar_p / SOLAR_GET_POWER_COUNT;
+        sum_solar_p = 0.0;
+        count_solar_p = 0;
+    }
+    else
+    {
+        sum_solar_p += mppt_output_p_get();
+    }
+
+    result = (0 < aver_solar_p && aver_solar_p < SOLAR_CHARGE_POWER_VALID); //
+    charger_printf("solar_charge_invalid::count=%d,sumpow=%d,averpow=%d,result=%d.\r\n", count_solar_p, (int32_t)sum_solar_p, (int32_t)aver_solar_p, result);
+    return result;
+}
+
+void charger_power_off(void)
+{
+    if (pf_gpio_read(GPIO_CHRG_SLEEP_EN) != CHARGER_CHIP_WAKE_VALUE) // The charger is disabled
+        return;
+    pf_gpio_write(GPIO_CHRG_SLEEP_EN, CHARGER_CHIP_SLEEP_VALUE); // Disable charge chip
+}
+
+void charger_power_on(void)
+{
+    if (pf_gpio_read(GPIO_CHRG_SLEEP_EN) != CHARGER_CHIP_WAKE_VALUE) // The charger is disabled
+    {
+        pf_gpio_write(GPIO_CHRG_SLEEP_EN, CHARGER_CHIP_WAKE_VALUE); // Enable charge chip
+        pf_i2c_0_uninit();
+        nrf_delay_ms(20);
+        pf_i2c_0_init();
+        nrf_delay_ms(30);                     // Left time for charge chip to initialize
+        mp2762a_init();
+    }
+}
+
+bool is_charger_power_on(void)
+{
+    if (pf_gpio_read(GPIO_CHRG_SLEEP_EN) != CHARGER_CHIP_WAKE_VALUE)
+        return false;
+    return true;
+}
+
+void setChargerOff(void)
+{
+    //	GPIO_PinOutSet(CHG_EN_PORT, CHG_EN_PIN);
+    charger_power_off();
+    //	mp2762a_charge_ctrl(false);
+    monet_data.ChargerStatus = CHARGER_OFF;
+    monet_data.ChargerDelay = 0;
+}
+
+void setChargerOn(void)
+{
+    //	GPIO_PinOutClear(CHG_EN_PORT, CHG_EN_PIN);
+    charger_power_on();
+    mp2762a_charge_ctrl(true);
+    monet_data.ChargerStatus = CHARGER_ON;
+    monet_data.ChargerDelay = 0;
+}
+
+//static uint8_t charger_state_bf_tn_off_chg = CHARGER_ON;	// Charger state before turnning off charger
+static uint8_t charger_state_record_check_cnt = 1;
+static uint8_t charger_state_recover_check_cnt = 0;
+
+void charger_state_record(void)
+{
+    if (charger_state_record_check_cnt) // Only run one time
+    {
+        charger_state_record_check_cnt--;
+        //		charger_state_bf_tn_off_chg = monet_data.ChargerStatus;
+        charger_state_recover_check_cnt = 1;
+    }
+}
+
+// @External_power_on_when_CS_on
+// This is for the case that
+// 1 When no external power, charger is turned off, Cargo Sensor is off then turned on.
+//    Because the previous state of charger is off, next time turning CS off function would keep the charger off state.
+// 2 But when external power is connected while CS is just on, because monet_data.V3PowerOn is 1, charger would not be turned on either.
+// Combine condition1 and condition2, they will make the charge always off and never recover.
+// To solve this problem, besides the condition (monet_data.V3PowerOn == 0), condition (monet_data.V3PowerOn == 1) should also be checked.
+// In condition (monet_data.V3PowerOn == 1), monet_data.PrevChargerStatus should be set to CHARGER_ON.
+// When CS is turned off, charger is turned on again.
+
+void charger_state_recover(void)
+{
+    if (charger_state_recover_check_cnt) // Only run one time
+    {
+        charger_state_recover_check_cnt--;
+        //		if (/*charger_state_bf_tn_off_chg == CHARGER_ON &&
+        //			*/monet_data.V3PowerOn == 0)
+        //			setChargerOn();
+        //		else if (monet_data.V3PowerOn == 1)	// For the case @External_power_on_when_CS_on
+        //		{
+        //			if (monet_data.PrevChargerStatus != CHARGER_ON)
+        //				monet_data.PrevChargerStatus = CHARGER_ON;
+        //		}
+        setChargerOn();
+        charger_state_record_check_cnt = 1;
+    }
+}
+
+bool flag_only_solar_check = false;
+bool flag_s_v_check = false;
+const uint32_t s_v_check_debounce_limit = 3;
+uint32_t s_v_check_debounce = s_v_check_debounce_limit;
+bool flag_low_solar_vol = false;
+
+bool is_solar_vol_low(void)
+{
+	return flag_low_solar_vol;
+}
+
+// This function is designed to be called in a 1 s periodic function
+void solar_chg_mode_proc(void)
+{
+	if (flag_only_solar_check == true)
+	{
+		if (only_solar_power() == true)
+		{
+			flag_only_solar_check = false;
+			solar_chg_mode_select(FUNC_JUMP_POINT_2);
+		}
+	}
+	
+	if (flag_s_v_check == true)
+	{
+		s_v_check_debounce--;
+		if (!s_v_check_debounce)
+		{
+			s_v_check_debounce = s_v_check_debounce_limit;
+			flag_s_v_check = false;
+			solar_chg_mode_select(FUNC_JUMP_POINT_1);
+		}
+	}
+}
+
+void solar_chg_mode_select(uint8_t jump_point)
+{
+	uint16_t sol_vol = 0;
+	uint32_t input_vol = 0;
+	double input_cur = 0.0;
+	double input_p = 0.0;
+	int32_t input_vol_limt_default = 8500;
+
+	// Parameters initialization
+	flag_only_solar_check = false;
+	flag_s_v_check = false;
+	s_v_check_debounce = s_v_check_debounce_limit;
+	timer_solar_chg_mode_stop();
+	flag_low_solar_vol = false;
+	
+	charger_printf("solar_chg_mode_select(), jump point %u\r", jump_point);
+	
+	switch (jump_point)
+	{
+		case FUNC_JUMP_POINT_0:
+			goto func_jump_point_0;
+//			break;	// Comment this line to avoid warning
+		case FUNC_JUMP_POINT_1:
+			goto func_jump_point_1;
+//			break;	// Comment this line to avoid warning
+		case FUNC_JUMP_POINT_2:
+			goto func_jump_point_2;
+//			break;	// Comment this line to avoid warning
+		case FUNC_JUMP_POINT_3:
+			goto func_jump_point_3;
+//			break;	// Comment this line to avoid warning
+		case FUNC_JUMP_POINT_4:
+			goto func_jump_point_4;
+//			break;	// Comment this line to avoid warning
+		default:
+			break;
+	}
+	
+func_jump_point_0:
+	setChargerOff();
+func_jump_point_1:
+    charger_printf("solar_chg_mode_select(), func_jump_point_1 MODE1\r", sol_vol);
+	solar_chg_mode_set(SOLAR_CHG_MODE1);
+	atel_adc_conv_force();
+	if (only_solar_power() == true)
+	{
+func_jump_point_2:
+		setChargerOff();
+		atel_adc_conv_force();
+		atel_adc_conv_force();
+		atel_adc_conv_force();
+		sol_vol = PF_ADC_RAW_TO_VSIN_MV(monet_data.AdcSolar);
+		charger_printf("solar_chg_mode_select(), sol V %u mV\r", sol_vol);
+		if (sol_vol > VOL_LIMIT_S_CHG_MODE_SEL)
+		{
+			setChargerOn();
+			mp2762a_input_vol_limit_set(MP2762A_INPUT_VOL_LIMIT_SOL);
+			nrf_delay_ms(200);	// Leave time for Charger chip to bring new configuration into effect
+			input_vol = mp2762a_input_vol_get();
+			input_cur = mp2762a_input_cur_get();
+			input_p = input_vol * input_cur;
+			charger_printf("solar_chg_mode_select(), V %u mV, I %u mA, P %u uW\r", input_vol, (uint32_t)input_cur, (uint32_t)input_p);
+			if ((input_p > SOLAR_POWER_LIMIT) ||
+                (monet_data.charge_mode2_disable == 1))
+			{
+				mp2762a_input_vol_limit_set(input_vol_limt_default); // Recover Input Voltage Limit setting
+				timer_solar_chg_mode_stop();	// Stop the periodic timer for checking mode switch
+				solar_chg_mode_set(SOLAR_CHG_MODE1);
+                monet_data.charge_status = CHARGE_STATUS_SOLAR_MODE_1_PROCESS;
+				charger_printf("solar_chg_mode_select(), set to Mode 1\r");
+			}
+			else
+			{
+func_jump_point_3:
+				mp2762a_input_vol_limit_set(input_vol_limt_default);
+				setChargerOff();
+				solar_chg_mode_set(SOLAR_CHG_MODE2);
+				timer_solar_chg_mode_restart();
+                monet_data.charge_status = CHARGE_STATUS_SOLAR_MODE_2;
+				charger_printf("solar_chg_mode_select(), set to Mode 2\r");
+			}
+		}	// if (sol_vol > VOL_LIMIT_S_CHG_MODE_SEL)
+		else
+		{
+func_jump_point_4:
+            // if (monet_data.charge_mode2_disable == 0 /*&& sol_vol > 6000*/)
+            // {
+            //     charger_printf("solar_chg_mode_select(), solar vol <= 11 V && Vbat < 8.2 set to Mode 2\r");
+            //     solar_chg_mode_set(SOLAR_CHG_MODE2);
+            //     monet_data.charge_status = CHARGE_STATUS_SOLAR_LOWPOWER_MODE_2;
+            //     timer_solar_chg_mode_restart();
+            // }
+            // else
+            {
+                //charger_printf("solar_chg_mode_select(), solar vol <= 11 V && Vbat > 8.2 set to OFF\r");
+                charger_printf("solar_chg_mode_select(), solar vol <= 11 V  set to OFF\r");
+                s_v_check_debounce = s_v_check_debounce_limit;
+			    flag_s_v_check = true;
+			    flag_low_solar_vol = true;
+                monet_data.charge_status = CHARGE_STATUS_SOLAR_LOWPOWER_OFF;
+            }
+		}
+	}	// if (only_solar_power() == true)
+	else
+	{
+		charger_printf("solar_chg_mode_select(), !only_solar_power() MODE1\r");
+		setChargerOn();
+		solar_chg_mode_set(SOLAR_CHG_MODE1);
+		flag_only_solar_check = true;
+        monet_data.charge_status = CHARGE_STATUS_EXTERNAL_POWER_PROCESS;
+	}
+}
+
+// Periodically check solar power state and set to correct mode
+// This function is designed to be periodically called in main loop, default 300 s (5 min)
+void solar_chg_mode_check_proc(void)
+{
+	if (need_to_check_sol_chg_mode != true)
+		return;
+	need_to_check_sol_chg_mode = false;
+	
+	solar_chg_mode_select(FUNC_JUMP_POINT_1);
+	charger_printf("solar_chg_mode_check_proc(), timer triggered\r");
+	
+//	if (only_solar_power() == false)	// When there are other power supply, enable charger and disable checking solar mode
+//	{
+//		NRF_LOG_RAW_INFO("solar_chg_mode_check_proc(), detected other power supplies\r");
+//		if (solar_mode_running == true)
+//		{
+//			solar_mode_running = false;
+////			if (no_external_power() == false)		// There are other power supplies, Main, AUX...
+////				&& is_charger_power_on() == false)
+//			{
+//				NRF_LOG_RAW_INFO("solar_chg_mode_check_proc(), enable Charger, set to Mode 1");
+//				solar_chg_mode_set(SOLAR_CHG_MODE1);
+////				setChargerOn();
+//				timer_solar_chg_mode_stop();
+//			}
+//		}
+//		NRF_LOG_FLUSH();
+//		return;
+//	}
+//	solar_mode_running = true;
+//	NRF_LOG_RAW_INFO("solar_chg_mode_check_proc(), solar chg mode (%u)\r", (uint32_t)solar_chg_mode_get());
+//    NRF_LOG_FLUSH();
+////	if (solar_chg_mode_get() == SOLAR_CHG_MODE1)
+////		mode_selection_subproc();
+////	else	// SOLAR_CHG_MODE2
+//		mode_selection_proc();
+}
+
+
+
+#define CHG_STATE_NOT_SPECIFIED 0
+#define CHG_STATE_CHG_IN_PROCESS 1
+#define CHG_STATE_CHG_COMPLETE 2
+#define CHG_STATE_EXCEPTION 3
+
+// @Battery_NTC_resistance_value
+// This value is for P2 new board (maybe P3 board) to check the connectivity of battery.
+// If the NTC resistance exceeds this value, it means the battery is not connected.
+// This method is not applicable for P2 or P1 board, because the charger NTC circuit is changed on P2 new board.
+// The resistance value comes from charger, the value is <300 kohm when NTC resistor in -40 degree Celsius,
+//   and ~5 megohm when battery is disconnectd.
+#define BAT_NTC_OPEN_LIMIT 1000000 // Battery NTC resistor open limit
+
+// Get charge state.
+// To keep compatibility, charge state definition keeps same with Simba code.
+//                                          stat1  stat2  stat
+// Not Specified                              0      0      0
+// Charge-in-progress                         0      1      1
+// Charge complete                            1      0      2
+// Charge suspend, timer fault, overvoltage,  1      1      3
+//   sleep mode, battery absent
+//
+// Other value would be ignored by caller.
+uint8_t getChargerState(void)
+{
+    static uint32_t bat_chg_done_dur = 0; // Battery charging done duration. Unit in seconds.
+
+    uint8_t chg_state = 0;
+    uint8_t fault_type1 = 0;
+    uint8_t fault_type2 = 0;
+    uint8_t fault_type3 = 0;
+    uint8_t fault_type4 = 0;
+    uint8_t fault_type5 = 0;
+    double ntc_res = 0.0;
+    double bat_vol = 0.0;
+    double chg_cur = 0.0;
+
+    if (is_charger_power_on() != true)
+    {
+        charger_printf("getChargerState(), chg state %u, charger chip is not on\r", CHG_STATE_EXCEPTION);
+        return CHG_STATE_EXCEPTION;
+    }
+
+    if (mp2762a_fault_watchdog_get(&fault_type1) == false)
+        return CHG_STATE_NOT_SPECIFIED;
+    if (mp2762a_fault_otg_get(&fault_type2) == false)
+        return CHG_STATE_NOT_SPECIFIED;
+    if (mp2762a_fault_chg_get(&fault_type3) == false)
+        return CHG_STATE_NOT_SPECIFIED;
+    if (mp2762a_fault_bat_get(&fault_type4) == false)
+        return CHG_STATE_NOT_SPECIFIED;
+    if (mp2762a_fault_ntc_get(&fault_type5) == false)
+        return CHG_STATE_NOT_SPECIFIED;
+    if (bat_ntc_res_get(&ntc_res) != true)
+        return CHG_STATE_NOT_SPECIFIED;
+
+    if (fault_type1 != MP2762A_WD_FAULT_NORMAL ||
+        fault_type2 != MP2762A_OTG_FAULT_NORMAL ||
+        fault_type3 != MP2762A_CHG_FAULT_NORMAL ||
+        fault_type4 != MP2762A_BAT_FAULT_NORMAL ||
+        fault_type5 == MP2762A_NTC_FAULT_NTC_COLD ||
+        fault_type5 == MP2762A_NTC_FAULT_NTC_COOL)
+    {
+        charger_printf("getChargerState(), chg state %u, charger fault %u %u %u %u %u\r",
+                         CHG_STATE_EXCEPTION, fault_type1, fault_type2, fault_type3, fault_type4, fault_type5);
+        return CHG_STATE_EXCEPTION;
+    }
+
+    if (ntc_res > BAT_NTC_OPEN_LIMIT) // Battery is not connected. Refer to @Battery_NTC_resistance_value for more info.
+    {
+        charger_printf("getChargerState(), chg state %u, NTC Res %u\r",
+                         CHG_STATE_EXCEPTION, (uint32_t)ntc_res);
+        return CHG_STATE_EXCEPTION;
+    }
+
+    bat_vol = mp2762a_bat_vol_get();
+    chg_cur = mp2762a_bat_chg_cur_get();
+    if (bat_vol >= BAT_VOL_LIMIT && chg_cur < CHG_CUR_LIMIT)
+    {
+        if (bat_chg_done_dur < BAT_CHG_DONE_DUR_MAX) // Make sure it will not overflow
+            bat_chg_done_dur++;
+    }
+    else
+    {
+        bat_chg_done_dur = 0;
+    }
+    charger_printf("bat_vol %u mV, chg_cur %u mA, bat_chg_done_dur %u\r", (uint32_t)bat_vol, (uint32_t)chg_cur, bat_chg_done_dur);
+
+    if (mp2762a_charge_state_get(&chg_state) == false)
+        return CHG_STATE_NOT_SPECIFIED;
+    if (chg_state == MP2762A_CHG_STAT_NOT_CHG ||
+        chg_state == MP2762A_CHG_STAT_CHG_TMN)
+    {
+        charger_printf("getChargerState(), chg state ret %u, chg state read %u\r",
+                         CHG_STATE_CHG_COMPLETE, chg_state);
+        return CHG_STATE_CHG_COMPLETE;
+    }
+    else if (chg_state == MP2762A_CHG_STAT_PRE_CHG ||
+             chg_state == MP2762A_CHG_STAT_FST_CHG)
+    {
+        charger_printf("getChargerState(), chg state ret %u, chg state read %u\r",
+                         CHG_STATE_CHG_IN_PROCESS, chg_state);
+        charger_printf("bat_chg_done_dur %u\r", bat_chg_done_dur);
+        if (bat_chg_done_dur > BAT_CHG_DONE_DUR_LIMIT)
+            return CHG_STATE_CHG_COMPLETE;
+        else
+            return CHG_STATE_CHG_IN_PROCESS;
+    }
+    else // To avoid compiler warning
+        return CHG_STATE_NOT_SPECIFIED;
+}
+
+void flashChargingStatus(void)
+{
+    uint8_t stat;
+
+    // monet_data.chargerBlink = 0;
+    // Check charger state
+    stat = getChargerState();
+
+    charger_printf("CHG state: (%u, %u), monet_data.ChargerRestartValue: %u,%u\r",
+                     stat, monet_data.ChargerStatus, monet_data.ChargerRestartValue, monet_data.ChargerDelay);
+    //////////////////////////////////////////////////////////////////////////////////////////////
+    //                                                                    stat1 stat2    stat
+    // Not Specified														0     0		   0
+    // Charge-in-progress													0     1		   1
+    // Charge complete														1     0		   2
+    // Charge suspend, timer fault, overvoltage, sleep mode, battery absent	1     1		   3
+    //////////////////////////////////////////////////////////////////////////////////////////////
+
+    switch (stat)
+    {
+    case 0:
+        // Should not happen
+        // flashOrange(0, 255);
+        break;
+    case 1:
+        // Charge in progress
+        // flashOrange(50, 0);
+        monet_data.ChargerDelay = 0;
+        break;
+    case 2:
+        // Charge complete
+        if (monet_data.ChargerStatus == CHARGER_ON)
+        {
+            // flashOrange(255, 0);
+            if (monet_data.ChargerRestartValue)
+            {
+                monet_data.ChargerDelay++;
+                if (monet_data.ChargerDelay >= CHARGER_DELAY)
+                {
+                    monet_data.PrevChargerStatus = CHARGER_OFF; // PUMAMCU-102 Ensure Charger remains off when power state changes
+                    if (recharge_start == true)
+                    {
+                        recharge_start = false; //recharge has ended.
+                                                // flashOrange(0, 255);      // NALAMCU-59 and NALAMCU-73:  orange led should be on solid for 10mins and then turn off indicating that charging is disabled.
+                    }
+                    if (monet_data.charge_status == CHARGE_STATUS_SOLAR_MODE_1_PROCESS) // only in mode 1 full,we will do this,
+                                                                                        // if No external full,TODO...
+                    {
+                        monet_data.charge_status = CHARGE_STATUS_SOLAR_MODE_1_FULL;
+                        // timer_solar_chg_mode_stop();
+                    }
+                    setChargerOff();
+                }
+            }
+        }
+        break;
+    case 3:
+        if (monet_data.ChargerStatus == CHARGER_OFF)
+        {
+            // flashOrange(0, 255);
+        }
+        else
+        {
+            if ((PF_ADC_RAW_TO_VIN_MV(monet_data.AdcMain) > ADC_MAIN_TH) ||
+                (PF_ADC_RAW_TO_VSIN_MV(monet_data.AdcSolar) > ADC_MAIN_TH))
+            {
+                // We should be charging or charged
+                // flashOrange(25, 25);
+            }
+            else
+            {
+                // monet_data.chargerBlink = 1;
+            }
+        }
+    }
+}
+
+void charger_restart_check(void)
+{
+    static bool charger_restart_is_set = true;
+    // Check if we need to restart the charger
+    uint16_t AdcBackup_mv;
+
+    charger_printf("charger_restart_check::Mode(%d) ChargerOn(%d) Mode2Disable(%d).\r", 
+                   solar_chg_mode_get(), 
+                   is_charger_power_on(),
+                   monet_data.charge_mode2_disable);
+
+    //if (monet_data.V3PowerOn == 0)
+    {
+        AdcBackup_mv = PF_ADC_RAW_TO_BATT_MV(monet_data.AdcBackup);
+        if ((no_external_power() == true) // This function should be called after ADC conversion
+            // || (only_solar_power() == true && solar_charge_invalid() == true)) //NALAMCU-46
+            || (only_solar_power() == true && solar_chg_mode_get() == SOLAR_CHG_MODE2) 
+            || (only_solar_power() == true && is_solar_vol_low() == true))
+        {
+            charger_printf("no external::AdcBackup_mv=%d.\r", AdcBackup_mv);
+            count_recharge_check = 0;     //set to init value
+            count_not_recharge_check = 0; //set to init value
+            recharge_start = false;       //set to init value
+            // flashOrange(0, 0);
+            // if (only_solar_power() == true && solar_charge_invalid() == true)
+            // {
+            //     if (is_charger_power_on() != true)
+            //     {
+            //         setChargerOn(); //turn on to read charger power ok and then can judge whether solar power is invalid for charge.
+            //     }
+            // }
+            // else
+            {
+                if (no_external_power() == true)
+                {
+                    charger_printf("no external::solar_chg_mode_set MODE1\r");
+                    solar_chg_mode_set(SOLAR_CHG_MODE1);
+                    timer_solar_chg_mode_stop();
+                    monet_data.charge_status = CHARGE_STATUS_NO_SOURCES;
+                }
+                charger_state_record(); // Should run before setChargerOff()
+                setChargerOff();
+            }
+        }
+        else
+        {
+            charger_printf("have external::ChargerRestartValue=%d.AdcBackup_mv=%d\r", monet_data.ChargerRestartValue, AdcBackup_mv);
+            if (monet_data.ChargerRestartValue == 0) //voltage for battery re-charging isn't set, charger state should be recovered.
+            {
+                count_recharge_check = 0;     //set to init value
+                count_not_recharge_check = 0; //set to init value
+                recharge_start = false;       //set to init value
+                charger_state_recover();      // Should run before flashChargingStatus()
+                flashChargingStatus();        // Note: this function should be called after ADC conversion
+            }
+            else //voltage for battery re-charging is set
+            {
+                if (charger_restart_is_set == true)
+                {
+                    charger_restart_is_set = false;
+                    recharge_start = true;
+                }
+
+                //NALAMCU-59
+                if (AdcBackup_mv <= monet_data.ChargerRestartValue) //battery voltage is lower than voltage for battery re-charging.
+                {
+                    count_recharge_check++;
+                    count_not_recharge_check = 0;
+                    if (count_recharge_check >= CHARGE_RESTART_CHECK_COUNT)
+                    {
+                        count_recharge_check = CHARGE_RESTART_CHECK_COUNT;
+                        if ((monet_data.charge_status == CHARGE_STATUS_SOLAR_MODE_1_FULL) ||
+                            (monet_data.charge_status == CHARGE_STATUS_NO_SOURCES))
+                        {
+                            monet_data.charge_status = CHARGE_STATUS_SOLAR_MODE_1_PROCESS;
+                            // monet_data.AdcBackupAccurate = monet_data.AdcBackup; // we can use adc value directly which was translated in 1s function
+                            // NRF_LOG_RAW_INFO("AdcBackupAccurate Vol: (%u mV : %u)\r",
+                            //                   adc_to_vol_conv(monet_data.AdcBackupAccurate, VOL_BAT_FACTOR),
+                            //                   monet_data.AdcBackupAccurate);
+                            // NRF_LOG_FLUSH();
+                            // timer_solar_chg_mode_restart();
+                        }
+                    }
+                }
+                else //battery voltage is higher than voltage for battery re-charging.
+                {
+                    count_not_recharge_check++;
+                    if (count_not_recharge_check >= CHARGE_RESTART_CHECK_COUNT) //higher than for CHARGE_RESTART_CHECK_COUNT times continuously,
+                    {
+                        count_not_recharge_check = CHARGE_RESTART_CHECK_COUNT;
+                        count_recharge_check = 0;
+                    }
+                }
+
+                charger_printf("count_recharge_check=%d,count_not_recharge_check=%d,recharge_start=%d\r", count_recharge_check, count_not_recharge_check, recharge_start);
+                if ((count_recharge_check >= CHARGE_RESTART_CHECK_COUNT) //battery voltage is lower than voltage for battery re-charging for CHARGE_RESTART_CHECK_COUNT times continuously, charger state should be recovered.
+                    || (recharge_start == true))                         //In order to ensure the battery is fully charged, set charger off only when recharge hasnot started.
+                {
+                    recharge_start = true;   //recharge has started.
+                    charger_state_recover(); // Should run before flashChargingStatus()
+                    flashChargingStatus();   // Note: this function should be called after ADC conversion
+                }
+                else
+                {
+                    charger_state_record(); // Should run before setChargerOff()
+                    setChargerOff();
+                }
+            }
+        }
+    }
+}
+
+uint8_t charger_exist_probe(void)
+{
+    uint8_t read_byte = 0, exist = 1;
+    int32_t probe_ret = 0;
+
+    nrf_gpio_cfg_output(P021_CHRG_SLEEP_EN);
+
+    pf_gpio_write(GPIO_CHRG_SLEEP_EN, CHARGER_CHIP_WAKE_VALUE);
+    pf_delay_ms(50);
+    pf_i2c_0_init();
+
+    probe_ret = pf_i2c_0_read(0x5C, 0x00, &read_byte, 1); // #define MP2762A_I2C_ADDR 0x5C
+    pf_log_raw(atel_log_ctl.error_en, "MP2762A Probe Reg(0x%x:0x%x) Err(%d).\r", 0x00, read_byte, probe_ret);
+
+    if (probe_ret != 0)
+    {
+        exist = 0;
+        pf_i2c_0_uninit();
+    }
+    else
+    {
+        //monet_data.ChargerRestartValue = 8200;
+        monet_data.ChargerRestartValue = 0;
+        pf_gpio_write(GPIO_CHRG_SLEEP_EN, CHARGER_CHIP_SLEEP_VALUE);
+    }
+    
+    return exist;
+}
+
+void charger_process_periodically(uint32_t delta_ms)
+{
+    static uint32_t charger_tick_ms = 0;
+
+    charger_tick_ms += delta_ms;
+    if (charger_tick_ms >= CHARGER_PROCESS_PERIOD_MS)
+    {
+        charger_tick_ms -= CHARGER_PROCESS_PERIOD_MS;
+    }
+    else
+    {
+        return;
+    }
+
+    charger_restart_check(); // Note: this function should be called after ADC conversion
+    mppt_process_nml();      // Note: this function should be called after ADC conversion
+    mp2762a_proc();
+    solar_chg_mode_proc();
+}

@@ -1,0 +1,1669 @@
+/*
+ * user.c
+ *
+ *  Created on: Dec 12, 2015
+ *      Author: J
+ */
+
+#include <string.h>          /* For memcpy definition */
+#include <stdio.h>
+
+#include "user.h"
+
+/* Define Slave Address  ---------------------------------------------------*/
+typedef enum {RESET = 0, SET = !RESET} BitStatus;
+
+static uint32_t gBWD = 3600; // LM-7
+static uint16_t gcount = 0;
+static uint32_t count1sec = 0;
+
+static bool eventIReadyFlag = false;
+
+gpio_conf monet_conf;
+gpio_data monet_gpio = {0};
+monet_struct monet_data = {0};
+
+atel_log_ctl_t atel_log_ctl = 
+{
+    .normal_en = 1,
+    .core_en = 1,
+    .io_protocol_en = 1,
+    .irq_handler_en = 1,
+    .platform_en = 1,
+    .warning_en = 1,
+    .error_en = 1,
+};
+
+uint8_t ring_buffer_from_mcu[RING_BUFFER_SIZE_FROM_MCU] = {0};
+
+extern uint32_t beacon_adv_interval;
+extern uint16_t beacon_adv_duration;
+extern uint8_t m_sn_info[MODULE_SN_LENGTH+1];
+extern uint8_t tx_1m_rssi;
+extern tx_power_struct tx_pwr_rssi[TX_LEVEL_LAST];
+
+#define GPIO_GET(index) (bool)((monet_gpio.gpiolevel >>index)&0x1)
+#define GPIO_SET(index, s)  monet_gpio.gpiolevel = (s>0) ? ((1<<index)|monet_gpio.gpiolevel): (monet_gpio.gpiolevel & (~(1<<index)))
+
+void BleConnectionHeartBeat(uint32_t second);
+extern void advertising_init(void);
+extern uint32_t pf_tx_power_set(int8_t tx_level);
+
+/******************************************************************************/
+/* User Functions                                                             */
+/******************************************************************************/
+void disableEventIReadyFlag(void) {
+    eventIReadyFlag = false;
+}
+
+void systemreset(uint8_t flag)
+{
+    NVIC_SystemReset();
+    while (1);
+}
+
+void InitApp(uint8_t boot)
+{
+    memset(&monet_data, 0, sizeof(monet_data));
+
+    monet_data.firstPowerUp = 1;
+
+    if (boot == 1)
+    {
+        monet_data.deviceBootDelayMs = DEVICE_BOOT_DELAY_MS;
+    }
+
+    /* Setup analog functionality and port direction */
+    ring_buffer_init(&monet_data.txQueueU1, ring_buffer_from_mcu, RING_BUFFER_SIZE_FROM_MCU);
+
+    init_config();
+    gpio_init();
+
+    turnOnDevice();
+
+    monet_data.iorxframe.state = IO_WAIT_FOR_DOLLAR;
+
+    if (boot != 2)
+    {
+        monet_data.sysTickUnit = TIME_UNIT;
+        pf_systick_start(monet_data.sysTickUnit);
+
+        pf_wdt_init();
+
+        monet_gpio.Intstatus |= MASK_FOR_BIT(INT_POWERUP); // Added power up flag to watch for Power up resets
+    }
+}
+
+void init_config(void)
+{
+    setdefaultConfig(0);
+
+    // If not first start up, keep the value of monet_gpio.Intstatus.
+    memset(&monet_gpio.WDtimer, 0, sizeof(monet_gpio) - ((uint32_t)(&monet_gpio.WDtimer) - (uint32_t)(&monet_gpio.Intstatus)));
+}
+
+void setdefaultConfig(uint8_t bat_en)
+{
+    uint32_t i;
+    uint8_t status = PIN_STATUS(1,0,1,0);
+
+    for(i=0; i< NUM_OF_GPIO_PINS; i++)
+    {
+        monet_conf.gConf[i].status = status;
+        monet_conf.gConf[i].Reload = 0;
+    }
+
+    #ifdef ATEL_GPIO_ASSOC
+    #undef ATEL_GPIO_ASSOC
+    #endif /* ATEL_GPIO_ASSOC */
+
+    #define ATEL_GPIO_ASSOC(enum,x,y,z,s) do {monet_conf.gConf[enum].status = (uint8_t)PIN_STATUS(x, y, z, s);} while(0);
+    
+    ATEL_ALL_GPIOS
+    #undef ATEL_GPIO_ASSOC
+
+    monet_conf.IntPin = GPIO_TO_INDEX(GPIO_NONE);
+    monet_conf.WD.Pin = GPIO_TO_INDEX(GPIO_NONE);
+
+    monet_conf.WD.Reload = 0xFFFFFFFF; //in second
+    monet_gpio.WDtimer = 0;
+    monet_gpio.WDflag = 0;
+}
+
+void gpio_init(void)
+{
+    uint8_t i;
+
+    for(i = 0; i< NUM_OF_GPIO; i++)
+    {
+        if ((i != GPIO_MCU_SLEEP_DEV) &&
+            (i != GPIO_MCU_SLEEP_DEV1))
+        {
+            configGPIO(i, monet_conf.gConf[i].status);
+
+            monet_gpio.counter[i] = monet_conf.gConf[i].Reload;
+            if((monet_conf.gConf[i].status & GPIO_DIRECTION) == DIRECTION_OUT) {
+                SetGPIOOutput(i, (bool)((monet_conf.gConf[i].status & GPIO_SET_HIGH)>0));
+            } else {
+                GPIO_SET(i, pf_gpio_read(i));
+            }
+        }
+    }
+}
+
+void configGPIO(int index, uint8_t status)
+{
+    atel_gpio_cfg_t gpio_cfg;
+
+    if (index >= GPIO_TO_INDEX(GPIO_NONE))
+    {
+        pf_log_raw(atel_log_ctl.error_en, "configGPIO Index Out of Range.\r");
+        return;
+    }
+
+    if((status & GPIO_DIRECTION) == DIRECTION_OUT)
+    {
+        if(status & GPIO_MODE)
+        {
+            gpio_cfg.func = ATEL_GPIO_FUNC_OUT;
+            gpio_cfg.pull = ATEL_GPIO_NOPULL;
+        } else {
+            gpio_cfg.func = ATEL_GPIO_FUNC_OD;
+            gpio_cfg.pull = ATEL_GPIO_PULLUP;
+        }
+
+        pf_gpio_cfg(index, gpio_cfg);
+    }
+    else
+    {
+        if(status & GPIO_MODE)
+        {
+            gpio_cfg.func = ATEL_GPIO_FUNC_INT;
+            gpio_cfg.sense = ATEL_GPIO_SENSE_TOGGLE;
+            gpio_cfg.pull = ATEL_GPIO_NOPULL;
+
+            pf_gpio_cfg(index, gpio_cfg);
+        }
+        else
+        {
+            gpio_cfg.func = ATEL_GPIO_FUNC_IN;
+            gpio_cfg.pull = ATEL_GPIO_NOPULL;
+            pf_gpio_cfg(index, gpio_cfg);
+        }
+    }
+}
+
+void SetGPIOOutput(uint8_t index, bool Active)
+{
+    if (index >= GPIO_TO_INDEX(GPIO_NONE))
+    {
+        pf_log_raw(atel_log_ctl.error_en, "SetGPIOOutput Index Out of Range.\r");
+        return;
+    }
+
+    // IRQ_OFF
+    if (((monet_conf.gConf[index].status & GPIO_OUTPUT_HIGH) && Active) ||
+        (!(monet_conf.gConf[index].status & GPIO_OUTPUT_HIGH) && !Active)) {
+        pf_gpio_write(index, 1);
+    } else {
+        pf_gpio_write(index, 0);
+    }
+
+    GPIO_SET(index, pf_gpio_read(index));
+
+    if(monet_conf.gConf[index].Reload) {
+        if(Active) {
+            monet_gpio.counter[index] = monet_conf.gConf[index].Reload;
+        } else {
+            monet_gpio.counter[index] = 0;
+        }
+    }
+    // IRQ_ON
+}
+
+void turnOnDevice(void)
+{
+    pf_uart_init();
+    if (monet_data.SleepState == SLEEP_HIBERNATE)
+    {
+        init_config();
+        gpio_init();
+        monet_data.SleepState = SLEEP_OFF;
+        monet_data.SleepStateChange = 1;
+        MCU_Wakeup_Device_App();
+    }
+
+    monet_data.devicePowerOnDelay = (monet_data.deviceBootDelayMs) ? DEVICE_POWER_ON_DELAY_SHORT_MS : DEVICE_POWER_ON_DELAY_MS;
+    monet_data.devicePowerOffDelay  = 0;
+    monet_data.SleepAlarm       = 0; // Disable the sleep timer
+    MCU_TurnOn_Device();
+}
+
+void turnOffDeviceCancel(uint8_t once)
+{
+    if (monet_data.devicePowerOn == 1)
+    {
+        monet_data.devicePowerOnDelay   = DEVICE_POWER_ON_DELAY_MS * once;
+        monet_data.devicePowerOffDelay  = 0;
+        monet_data.SleepAlarm           = 0; // Disable the sleep timer
+    }
+}
+
+void turnOffDevice(void)
+{
+    monet_data.devicePowerOnDelay = (monet_data.deviceBootDelayMs) ? DEVICE_POWER_ON_DELAY_SHORT_MS : DEVICE_POWER_ON_DELAY_MS;
+    monet_data.devicePowerOffDelay = DEVICE_POWER_OFF_DELAY_MS;
+    disableEventIReadyFlag();
+}
+
+void MCU_TurnOn_Device(void)
+{
+    if (monet_data.firstPowerUp) {
+        monet_data.firstPowerUp = 0;
+        monet_data.devicePowerOnDelay = DEVICE_FIRST_POWER_ON_DELAY_MS;
+    }
+    monet_data.devicePowerOn = 1;
+}
+
+void MCU_TurnOff_Device(void)
+{
+    monet_data.deviceofftime = count1sec;
+    monet_data.devicePowerOn = 0;
+
+    monet_data.SleepState = SLEEP_HIBERNATE;
+    monet_data.SleepStateChange = 1;
+
+    monet_data.devicePowerOnDelay = 0;
+    monet_data.devicePowerOffDelay  = 0;
+
+    if (monet_data.uartTXDEnabled != 0)
+    {
+        // while (atel_io_queue_process()); // Sendout all data in queue.
+        pf_uart_deinit();
+    }
+
+    MCU_Sleep_Device_App();
+
+    pf_cfg_before_hibernation();
+}
+
+void MCU_Wakeup_Device_App(void)
+{
+    if ((monet_data.uartTXDEnabled == 0) && (monet_data.uartToBeInit == 0))
+    {
+        monet_data.uartToBeInit = 1;
+        monet_data.uartTickCount = 0;
+    }
+
+    monet_conf.gConf[GPIO_MCU_SLEEP_DEV].status = (uint8_t)PIN_STATUS(0, 1, 0, 1);
+    monet_conf.gConf[GPIO_MCU_SLEEP_DEV1].status = (uint8_t)PIN_STATUS(0, 1, 0, 1);
+    configGPIO(GPIO_MCU_SLEEP_DEV, monet_conf.gConf[GPIO_MCU_SLEEP_DEV].status);
+    configGPIO(GPIO_MCU_SLEEP_DEV1, monet_conf.gConf[GPIO_MCU_SLEEP_DEV1].status);
+}
+
+void MCU_Sleep_Device_App(void)
+{
+    monet_conf.gConf[GPIO_MCU_SLEEP_DEV].status = (uint8_t)PIN_STATUS(0, 1, 0, 1);
+    monet_conf.gConf[GPIO_MCU_SLEEP_DEV1].status = (uint8_t)PIN_STATUS(1, 1, 0, 0);
+    configGPIO(GPIO_MCU_SLEEP_DEV, monet_conf.gConf[GPIO_MCU_SLEEP_DEV].status);
+    configGPIO(GPIO_MCU_SLEEP_DEV1, monet_conf.gConf[GPIO_MCU_SLEEP_DEV1].status);
+
+    monet_data.deviceWakeupDetect = 0;
+
+    monet_data.appActive = 0;
+}
+
+int8_t atel_io_queue_process(void)
+{
+    int8_t ret = 0;
+    static uint8_t txq_resend = 0;
+    static uint8_t txq_resend_value = 0;
+    uint32_t again_count = 0;
+    uint8_t tmp = 0;
+
+RXQ_AGAIN:
+    if (pf_uart_rx_one(&tmp) == 0)
+    {
+        if (monet_data.deviceBootDelayMs == 0)
+        {
+            device_poweroff_delay_refresh();
+        }
+
+        GetRxCommandEsp(tmp);
+        again_count++;
+        if (again_count <= (MAX_COMMAND))
+        {
+            goto RXQ_AGAIN;
+        }
+    }
+
+    again_count = 0;
+
+    if (monet_data.uartTXDEnabled == 0)
+    {
+        return ret;
+    }
+
+TXQ_AGAIN:
+    if ((ring_buffer_is_empty(&monet_data.txQueueU1) == 0) && monet_data.devicePowerOn)
+    {
+        uint8_t txdata = 0;
+        uint32_t force_send_count = 0;
+
+        FORCE_SEND_AGAIN:
+        if (txq_resend)
+        {
+            if (pf_uart_tx_one(txq_resend_value) == 0)
+            {
+                txq_resend = 0;
+                txq_resend_value = 0;
+
+                again_count++;
+                if (again_count <= (MAX_COMMAND / 64))
+                {
+                    goto TXQ_AGAIN;
+                }
+            }
+        }
+        else
+        {
+            ring_buffer_out(&monet_data.txQueueU1, &txdata);
+            if (pf_uart_tx_one(txdata) == 0)
+            {
+                again_count++;
+                if (again_count <= (MAX_COMMAND / 64))
+                {
+                    goto TXQ_AGAIN;
+                }
+            }
+            else
+            {
+                txq_resend = 1;
+                txq_resend_value = txdata;
+            }
+        }
+
+        if (txq_resend)
+        {
+            force_send_count++;
+            if (force_send_count < 3)
+            {
+                nrf_delay_ms(1);
+                goto FORCE_SEND_AGAIN;
+            }
+        }
+
+        ret = 1;
+    }
+
+    if (txq_resend)
+    {
+        pf_log_raw(atel_log_ctl.core_en, "atel_io_queue_process txq_resend(%d)\r", txq_resend);
+        pf_uart_deinit();
+        nrf_delay_ms(5);
+        pf_uart_init();
+    }
+
+    return ret;
+}
+
+// Data format:
+// Length(byte):  1  1   1   LEN       1
+// Content:      '$' LEN CMD data_body 0x0D
+void GetRxCommand(uint8_t RXByte)
+{
+    static uint8_t parmCount = 0;
+
+    switch(monet_data.iorxframe.state) {
+    case IO_WAIT_FOR_DOLLAR:
+        if(RXByte == '$') {
+            monet_data.appActive = 1;
+            monet_data.iorxframe.state = IO_GET_FRAME_LENGTH;
+        }
+        break;
+    case IO_GET_FRAME_LENGTH:
+        #if CMD_CHECKSUM
+		RXByte--;
+        #endif /* CMD_CHECKSUM */
+        if (RXByte <= MAX_COMMAND) {
+            monet_data.iorxframe.length = RXByte;
+            monet_data.iorxframe.remaining = RXByte;
+            monet_data.iorxframe.state = IO_GET_COMMAND;
+        } else {
+            monet_data.iorxframe.state = IO_WAIT_FOR_DOLLAR;
+        }
+        break;
+    case IO_GET_COMMAND:
+        monet_data.iorxframe.cmd = RXByte;
+        monet_data.iorxframe.state = IO_GET_CARRIAGE_RETURN;
+        monet_data.iorxframe.checksum = RXByte;
+        parmCount = 0;
+        break;
+    case IO_GET_CARRIAGE_RETURN:
+        monet_data.iorxframe.checksum += RXByte;
+        if (monet_data.iorxframe.remaining == 0) {
+            #if CMD_CHECKSUM
+			if (monet_data.iorxframe.checksum == 0xFF) {
+            #else
+			if (RXByte == 0x0D) {
+            #endif /* CMD_CHECKSUM */
+                HandleRxCommand();
+            }
+            monet_data.iorxframe.state = IO_WAIT_FOR_DOLLAR;
+        } else {
+            monet_data.iorxframe.remaining--;
+            monet_data.iorxframe.data[parmCount++] = RXByte;
+        }
+        break;
+    default:
+        monet_data.iorxframe.state = IO_WAIT_FOR_DOLLAR;
+        break;
+    }
+}
+
+void GetRxCommandEsp(uint8_t RXByte)
+{
+#if CMD_ESCAPE
+    // Ensure protocol is resynced if un-escaped $ is revc'd
+    if (RXByte == '$')
+    {
+        // Clean up old data
+        memset(&monet_data.iorxframe, 0, sizeof(monet_data.iorxframe));
+        // Setup for new message
+        monet_data.iorxframe.state = IO_WAIT_FOR_DOLLAR;
+        monet_data.iorxframe.escape = IO_GET_NORMAL;
+    }
+
+    if (monet_data.iorxframe.state == IO_WAIT_FOR_DOLLAR) {
+        GetRxCommand(RXByte);
+        monet_data.iorxframe.escape = IO_GET_NORMAL;
+        return;
+    }
+
+    switch (monet_data.iorxframe.escape) {
+    case IO_GET_NORMAL:
+        if (RXByte == '!')
+        {
+            monet_data.iorxframe.escape = IO_GET_ESCAPE;
+        }
+        else {
+            GetRxCommand(RXByte);
+        }
+        break;
+    case IO_GET_ESCAPE:
+        monet_data.iorxframe.escape = IO_GET_NORMAL;
+        if (RXByte == '0')
+            GetRxCommand('$');
+        else if (RXByte == '1')
+            GetRxCommand('!');
+        else {
+            // Reset the state
+            monet_data.iorxframe.state = IO_WAIT_FOR_DOLLAR;
+        }
+        break;
+    }
+#else
+    GetRxCommand(RXByte);
+#endif /* CMD_ESCAPE */
+}
+
+void atel_timerTickHandler(uint32_t tickUnit_ms)
+{
+    uint8_t i, bDoReport=0;
+    BitStatus  s;
+    uint8_t count = 0;
+
+    if (gTimer)
+    {
+        gTimer--;
+    }
+    else
+    {
+        return;
+    }
+
+    pf_wdt_kick();
+
+    for(i=0; i < NUM_OF_GPIO; i++) {
+        if ((monet_conf.gConf[i].status & GPIO_DIRECTION) == DIRECTION_OUT) { //including watchdog timer
+            if (monet_gpio.counter[i]) {
+                monet_gpio.counter[i]--;
+                if (monet_gpio.counter[i]==0) {
+                    // WARNING: this may cause GPIO pin status change
+                    pf_gpio_toggle(i);
+                    GPIO_SET(i, pf_gpio_read(i));
+                    pf_log_raw(atel_log_ctl.core_en, "pf_gpio_toggle(index: %d value: %d)\r", i, GPIO_GET(i));
+                }
+            }
+        } else { // Input
+            if ((monet_conf.gConf[i].status & GPIO_IT_MODE) &&
+                (i < MAX_EXT_GPIOS)) { // No need to read the internal GPIO pins
+                if (monet_gpio.counter[i] || !monet_conf.gConf[i].Reload) {
+                    if (monet_gpio.counter[i]) {
+                        monet_gpio.counter[i]--;
+                    }
+                    if (!monet_gpio.counter[i] || !monet_conf.gConf[i].Reload) {
+                        s = (BitStatus)(pf_gpio_read(i) > 0);
+                        if (GPIO_GET(i) != s) {
+                            GPIO_SET(i,s);
+                            switch(monet_conf.gConf[i].status & GPIO_IT_MODE) {
+                            case GPIO_IT_LOW_TO_HIGH:
+                                if(s) {
+                                    bDoReport = 1;
+                                }
+                                break;
+                            case GPIO_IT_HIGH_TO_LOW:
+                                if(!s) {
+                                    bDoReport = 1;
+                                }
+                                break;
+                            case GPIO_IT_BOTH:
+                                bDoReport = 1;
+                                break;
+                            default:
+                                break;
+                            }
+                            if (bDoReport) {
+                                monet_gpio.Intstatus |= 1<<i;
+                                bDoReport = 0;
+                            }
+                        }
+                    }
+                } else {
+                    s = (BitStatus)(pf_gpio_read(i) > 0);
+                    if (GPIO_GET(i) != s) {
+                        monet_gpio.counter[i] = monet_conf.gConf[i].Reload;
+                    }
+                }
+            } else {
+                GPIO_SET(i, pf_gpio_read(i));
+            }
+        } //End of Input
+    } //End of for loop
+
+    gcount += tickUnit_ms;
+    while (gcount >= TIME_UINT_SECOND_TIMER_PERIOD) {
+        if (count == 0)
+        {
+            atel_timer_s(gcount / 1000);
+        }
+        if (gcount >= TIME_UINT_SECOND_TIMER_PERIOD)
+        {
+            gcount -= TIME_UINT_SECOND_TIMER_PERIOD;
+        }
+        count++;
+    }
+
+    atel_uart_restore();
+
+    device_poweroff_delay_detect(tickUnit_ms);
+
+    device_bootloader_enter_dealy(tickUnit_ms);
+}
+
+void atel_timer_s(uint32_t seconds)
+{
+    const uint16_t delta = seconds;
+
+    count1sec += seconds;
+
+    pf_log_raw(atel_log_ctl.normal_en, "timer_s: %d Int(0x%x) Slp(%d) WD(%d) SAlarm(%d) OD(%d)\r",
+               count1sec,
+               monet_gpio.Intstatus,
+               monet_data.SleepState,
+               monet_gpio.WDtimer,
+               monet_data.SleepAlarm,
+               monet_data.devicePowerOnDelay);
+
+    if (monet_data.deviceBootDelayMs > seconds)
+    {
+        monet_data.deviceBootDelayMs -= (seconds * 1000);
+    }
+    else
+    {
+        monet_data.deviceBootDelayMs = 0;
+    }
+
+    if (monet_data.SleepState)
+    {
+        if ((pf_gpio_read(GPIO_MCU_SLEEP_DEV1) == 1) && (monet_data.deviceBootDelayMs == 0))
+        {
+            monet_data.deviceWakeupDetect++;
+        }
+        pf_log_raw(atel_log_ctl.normal_en, "BLE TX(%d) BLE RX(%d) BD(%d) WU(%d)\r",
+                   pf_gpio_read(GPIO_MCU_SLEEP_DEV),
+                   pf_gpio_read(GPIO_MCU_SLEEP_DEV1),
+                   monet_data.deviceBootDelayMs,
+                   monet_data.deviceWakeupDetect);
+    }
+
+    if((monet_conf.WD.Reload != 0xFFFFFFFF) && (monet_gpio.WDtimer == 0)) {
+        pf_log_raw(atel_log_ctl.core_en, "Watchdog Timeout.\r");
+        MCU_TurnOff_Device();
+        systemreset(monet_gpio.WDflag);
+        // Don't allow timer to be reset until modem is powered off
+        monet_gpio.WDtimer = gBWD;
+        monet_gpio.WDflag = 0;
+    } else if(monet_conf.WD.Reload != 0xFFFFFFFF) {
+        if (monet_gpio.WDtimer > delta) {
+            monet_gpio.WDtimer -= delta;
+        }
+        else {
+            monet_gpio.WDtimer = 0;
+        }
+    }
+
+   // Check if wakeup call was ordered
+   if (monet_data.SleepAlarm != 0) {
+       if (monet_data.SleepAlarm > delta) {
+           monet_data.SleepAlarm -= delta;
+       }
+       else {
+           monet_data.SleepAlarm = 0;
+           pf_log_raw(atel_log_ctl.core_en, "SleepAlarm is 0\r");
+           monet_gpio.Intstatus |= MASK_FOR_BIT(INT_TIMER); // This will force modem on in CheckInterrupt()
+       }
+   }
+}
+
+void atel_uart_restore(void)
+{
+    if ((monet_data.uartToBeInit == 1) && (monet_data.uartTXDEnabled == 0)) {
+        monet_data.uartTickCount++;
+        if (monet_data.uartTickCount <= 0) {
+            pf_gpio_write(GPIO_MCU_SLEEP_DEV, 1);
+        }
+        else if (monet_data.uartTickCount <= 0) {
+            pf_gpio_write(GPIO_MCU_SLEEP_DEV, 0);
+        }
+        else {
+            // TODO: disbale uart tx rx gpio function
+            pf_uart_init();
+            monet_data.uartToBeInit = 0;
+            monet_data.uartTickCount = 0;
+            monet_data.SleepState = SLEEP_OFF;
+        }
+    }
+}
+
+void device_poweroff_delay_refresh(void)
+{
+    if (monet_data.devicePowerOffDelay != 0)
+    {
+        monet_data.devicePowerOffDelay = DEVICE_POWER_OFF_DELAY_MS;
+    }
+
+    if (monet_data.devicePowerOnDelay != 0)
+    {
+        monet_data.devicePowerOnDelay = (monet_data.deviceBootDelayMs) ? DEVICE_POWER_ON_DELAY_SHORT_MS : DEVICE_POWER_ON_DELAY_MS;
+    }
+}
+
+void device_poweroff_delay_detect(uint32_t delta)
+{
+    if (monet_data.devicePowerOn == 1)
+    {
+        monet_data.devicePowerOnTimeMs += delta;
+        monet_data.devicePowerOffTimeMs = 0;
+    }
+    else
+    {
+        monet_data.devicePowerOnTimeMs = 0;
+        monet_data.devicePowerOffTimeMs += delta;
+    }
+
+    if (monet_data.devicePowerOffDelay) {
+       if (monet_data.devicePowerOffDelay > delta) {
+           monet_data.devicePowerOffDelay -= delta;
+       }
+       else {
+           monet_data.devicePowerOffDelay = 0;
+           pf_log_raw(atel_log_ctl.core_en, "Off into hibernate sleep: %d\r", monet_data.uartTXDEnabled);
+           MCU_TurnOff_Device();
+       }
+   }
+
+   if ((monet_data.devicePowerOnDelay) &&
+       (monet_data.devicePowerOn == 1)) {
+       if (monet_data.devicePowerOnDelay > delta) {
+           monet_data.devicePowerOnDelay -= delta;
+       } else {
+           monet_data.devicePowerOnDelay = 0;
+           pf_log_raw(atel_log_ctl.core_en, "On into hibernate sleep: %d\r", monet_data.uartTXDEnabled);
+           MCU_TurnOff_Device();
+       }
+   }
+}
+
+void device_bootloader_enter_dealy(uint32_t delta)
+{
+    if ((monet_data.deviceBootEnterDelay) &&
+       (monet_data.devicePowerOn == 1)) {
+       if (monet_data.deviceBootEnterDelay > delta) {
+           monet_data.deviceBootEnterDelay -= delta;
+       } else {
+           monet_data.deviceBootEnterDelay = 0;
+           pf_log_raw(atel_log_ctl.core_en, ">>>Enter device bootloader.\r");
+           pf_bootloader_pre_enter();
+           pf_bootloader_enter();
+           pf_log_raw(atel_log_ctl.core_en, ">>>Enter device err.\r");
+       }
+   }
+}
+
+void CheckInterrupt(void)
+{
+    if (monet_gpio.Intstatus)
+    {
+        if (!monet_data.devicePowerOn &&
+            !monet_gpio.WDflag)
+        {
+            // TODO: Do we need these conditions?
+            // pic_turnOnBaseband();
+        }
+        else if (monet_data.devicePowerOn)
+        {   // Must be sleeping not hibernating
+            monet_data.SleepAlarm = 0; // Disable the sleep timer
+            // WARNING: This will be called a lot time when modem is not start
+            // MCU_Wakeup_Device();
+            // MCU_Wakeup_Device_App();
+        }
+    }
+
+    /*if (monet_data.bleDisconnectEvent)
+    {
+        ble_connection_status_inform(0, 0);
+        monet_data.bleDisconnectEvent = 0;
+        monet_data.bleConnectionStatus = 0;
+    }
+
+    if (monet_data.bleConnectionEvent)
+    {
+        ble_connection_status_inform(0, 1);
+        monet_data.bleConnectionEvent = 0;
+        monet_data.bleConnectionStatus = 1;
+    }*/
+
+    if ((monet_data.deviceWakeupDetect != 0) ||
+        (monet_data.devicePowerOnPending != 0))
+    {
+        if ((monet_data.deviceWakeupDetect) && (monet_data.devicePowerOn == 0))
+        {
+            monet_data.devicePowerOnPending = 1;
+        }
+
+        if ((monet_data.devicePowerOn == 0) &&
+            (monet_data.devicePowerOffTimeMs >= DEVICE_POWER_ON_PENDING_MS))
+        {
+            turnOnDevice();
+            // ble_inform_device_mac();
+            pf_log_raw(atel_log_ctl.core_en, ">>>turnOnDevice W(%d) Ot(%d).\r",
+                       monet_data.deviceWakeupDetect,
+                       monet_data.devicePowerOffTimeMs);
+            monet_data.devicePowerOnPending = 0;
+        }
+        monet_data.deviceWakeupDetect = 0;
+    }
+}
+
+
+/* Frame Structure: <0x7E><0x7E>$<L><C><P><CKSM><CR><LF>
+ * <0x7E><0x7E> - Preamble
+ * $ - 0x24
+ * L - Length of <P>, 1 byte
+ * C - Command, 1 byte
+ * P - Parameters, <L> bytes
+ * <CKSM> - Checksum, 1 byte
+ * <CR> - 0x0D
+ * <LF> - 0x0A
+ *
+ * nSize - the size of parameters
+ */
+void BuildFrame(uint8_t cmd, uint8_t * pParameters, uint8_t nSize)
+{
+    uint8_t  i;
+    uint8_t sum;
+    ring_buffer_t *pQueue;
+
+    pQueue = &monet_data.txQueueU1;
+
+    #if BLE_DATA_CHANNEL_SUPPORT
+    if (IO_CMD_CHAR_BLE_RECV == cmd)
+    {
+        nSize += 1;
+    }
+    #endif /* BLE_DATA_CHANNEL_SUPPORT */
+
+    if (ring_buffer_left_get(pQueue) < (nSize + 8)) {
+        // No room
+        return;
+    }
+
+    // IRQ_OFF;
+    ring_buffer_in(pQueue, 0x7E);
+    ring_buffer_in(pQueue, 0x7E);
+    ring_buffer_in(pQueue, '$');
+
+    pf_print_mdm_uart_tx_init();
+
+    pf_print_mdm_uart_tx('$');
+#if USE_CHECKSUM
+    #if CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, nSize + 1);
+    #else
+    ring_buffer_in(pQueue, nSize + 1);
+    #endif /* CMD_ESCAPE */
+
+    pf_print_mdm_uart_tx(nSize + 1);
+#else
+    #if CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, nSize);
+    #else
+    ring_buffer_in(pQueue, nSize);
+    #endif /* CMD_ESCAPE */
+
+    pf_print_mdm_uart_tx(nSize);
+#endif /* USE_CHECKSUM */
+    #if CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, cmd);
+    #else
+    ring_buffer_in(pQueue, cmd);
+    #endif /* CMD_ESCAPE */
+
+    pf_print_mdm_uart_tx(cmd);
+
+    sum = cmd;
+
+    #if BLE_DATA_CHANNEL_SUPPORT
+    if (IO_CMD_CHAR_BLE_RECV == cmd)
+    {
+    #if CMD_ESCAPE
+        ring_buffer_in_escape(pQueue, (uint8_t)monet_data.ble_recv_channel);
+    #else
+        ring_buffer_in(pQueue, (uint8_t)monet_data.ble_recv_channel);
+    #endif /* CMD_ESCAPE */
+
+        pf_print_mdm_uart_tx((uint8_t)monet_data.ble_recv_channel);
+
+    #if USE_CHECKSUM
+        sum += (uint8_t)monet_data.ble_recv_channel;
+    #endif /* USE_CHECKSUM */
+        nSize -= 1;
+    }
+    #endif /* BLE_DATA_CHANNEL_SUPPORT */
+
+    for(i=0; i < nSize; i++) {
+        #if CMD_ESCAPE
+        ring_buffer_in_escape(pQueue, pParameters[i]);
+        #else
+        ring_buffer_in(pQueue, pParameters[i]);
+        #endif /* CMD_ESCAPE */
+
+        pf_print_mdm_uart_tx(pParameters[i]);
+
+        sum += pParameters[i];
+    }
+
+#if USE_CHECKSUM
+    #if CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, sum ^ 0xFF);
+    #else
+    ring_buffer_in(pQueue, sum ^ 0xFF);
+    #endif /* CMD_ESCAPE */
+    
+    pf_print_mdm_uart_tx(sum ^ 0xFF);
+#endif /* USE_CHECKSUM */
+
+    ring_buffer_in(pQueue, 0x0D);
+    ring_buffer_in(pQueue, 0x0A); // For easier readability when capturing wire logs
+
+    pf_print_mdm_uart_tx(0x0D);
+    // IRQ_ON;
+}
+
+void ble_connection_status_inform(uint16_t channel, uint8_t state)
+{
+    uint8_t buf[16] = {0};
+
+    buf[0] = 'c';
+    buf[1] = channel;
+    buf[2] = state;
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, buf, 3);
+}
+
+void ble_advertisement_status_inform(uint8_t state)
+{
+    uint8_t buf[16] = {0};
+
+    buf[0] = 's';
+    buf[1] = state;
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, buf, 2);
+}
+
+void Hex2String(char *str, uint8_t *bcd_array, uint16_t length)
+{
+	uint16_t i, k = 0;
+	
+	for (i = 0; i < length; ++i)
+	{
+		for (k = 0; k < 2; k++)
+		{
+			char bcd;
+
+			bcd = (k == 0) ? (bcd_array[i] >> 4) & 0x0F : bcd_array[i] & 0x0F;
+			if (bcd > 0x09 && bcd < 0x10)
+			{
+				str[k+i*2] = bcd + 0x37;
+			}
+			else
+			{
+				str[k+i*2] = bcd | 0x30;
+			}
+		}
+	}
+	str[2*i] = '\0';
+}
+
+void monet_bleCcommand_m(uint8_t** param, uint8_t *p_len)
+{
+    #define BLE_CONTRIL_m_COMMAND_LEN (7)
+    uint8_t Param[16] = {0};
+
+    *param += 1;
+    *p_len -= 1;
+
+    Param[0] = 'M';
+    Param[1] = 0xff;
+
+    if (*p_len < BLE_CONTRIL_m_COMMAND_LEN)
+    {
+        pf_log_raw(atel_log_ctl.error_en, "monet_bleCcommand_m len(%d) err\r", *p_len);
+    }
+    
+    memcpy(Param + 2, monet_data.ble_mac_addr, BLE_MAC_ADDRESS_LEN);
+
+    *param += BLE_CONTRIL_m_COMMAND_LEN;
+    *p_len -= BLE_CONTRIL_m_COMMAND_LEN;
+
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, Param, BLE_CONTRIL_m_COMMAND_LEN + 1);
+}
+
+void monet_bleCcommand_D(uint8_t** param, uint8_t *p_len)
+{
+    uint8_t Param[16] = {0};
+    uint8_t parm_len = 0;
+
+    *param += 1;
+    *p_len -= 1;
+
+    Param[0] = 'd';
+    Param[1] = (*param)[0];
+    parm_len += 2;
+
+    pf_log_raw(atel_log_ctl.error_en, "monet_bleCcommand_D cmd(0x%x)\r", (*param)[0]);
+
+    switch ((*param)[0])
+    {
+        case 'E':
+        pf_dtm_enter();
+        break;
+
+        case 'C':
+        pf_dtm_cmd((*param)[1], (*param)[2], (*param)[3], (*param)[4]);
+        memcpy(Param + 2, *param + 1, 4);
+        *param += 4;
+        *p_len -= 4;
+        parm_len += 4;
+        break;
+
+        case 'X':
+        pf_dtm_exit();
+        break;
+
+        default:
+        pf_log_raw(atel_log_ctl.error_en, "monet_bleCcommand_D unknown cmd\r");
+        *p_len = 0;
+        break;
+    }
+
+    *param += 1;
+    *p_len -= 1;
+
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, Param, parm_len);
+}
+
+void monet_bleCcommand_A(uint8_t** param, uint8_t *p_len)
+{
+    uint8_t Param[16] = {0};
+    uint8_t parm_len = 0;
+
+    pf_log_raw(atel_log_ctl.error_en, "monet_bleCcommand_A(Len: %d)\r", *p_len);
+
+    *param += 1;
+    *p_len -= 1;
+    parm_len += 2;
+
+    if ((*param)[0] == 0)			// Stop advertise
+    {
+	 if(monet_data.bleAdvertiseStatus)
+	    ble_aus_advertising_stop();
+    }
+    else if ((*param)[0] == 1)		// Start advertise
+    {
+    	 if(!monet_data.bleAdvertiseStatus)
+		ble_aus_advertising_start();
+    }
+
+    Param[0] = 'a';
+    Param[1] = (*param)[0];
+
+    *param += 1;
+    *p_len -= 1;
+
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, Param, parm_len);
+}
+
+void monet_bleCcommand_P(uint8_t** param, uint8_t *p_len)
+{
+    uint8_t Param[16] = {0};
+    uint8_t parm_len = 0;
+    int8_t tx_power_default = 4;
+
+    *param += 1;
+    *p_len -= 1;
+    parm_len += 2;
+
+    pf_log_raw(atel_log_ctl.error_en, "monet_bleCcommand_P cmd(0x%d)\r", (*param)[0]);
+
+    switch((*param)[0]) {
+        case TX_LEVEL_P8: {
+            pf_log_raw(atel_log_ctl.io_protocol_en, "Not support in SIMBA project, the max Tx power is +4dBm\r");
+        }
+        break;
+        case TX_LEVEL_P4: {
+            tx_power_default = 4;  //+4dBm
+        }
+        break;
+        case TX_LEVEL_0: {
+            tx_power_default = 0;  //0dBm
+        }
+        break;
+        case TX_LEVEL_N4: {
+            tx_power_default = -4;  //-4dBm
+        }
+        break;
+        case TX_LEVEL_N8: {
+            tx_power_default = -8;  //-8dBm
+        }
+        break;
+        case TX_LEVEL_N12: {
+            tx_power_default = -12;  //-12dBm
+        }
+        break;
+        case TX_LEVEL_N16: {
+            tx_power_default = -16;  //-16dBm
+        }
+        break;
+        case TX_LEVEL_N20: {
+            tx_power_default = -20;  //-20dBm
+        }
+        break;
+		
+        default:
+        break;
+    }
+
+
+    if (pf_tx_power_set(tx_power_default) == NRF_SUCCESS)
+    {
+        if((*param)[0] != TX_LEVEL_P8)
+        	tx_1m_rssi = tx_pwr_rssi[(*param)[0]].txRssi;
+        else
+        	tx_1m_rssi = tx_pwr_rssi[TX_LEVEL_P4].txRssi;
+		
+        advertising_data_update(beacon_adv_interval, beacon_adv_duration, 0);
+
+        pf_log_raw(atel_log_ctl.io_protocol_en, "TxPwr(%d, 0x%x)\r", tx_power_default, tx_1m_rssi);
+
+    }
+
+
+    Param[0] = 'p';
+    Param[1] = (*param)[0];
+
+    *param += 1;
+    *p_len -= 1;
+
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, Param, parm_len);
+}
+
+void test_bleCcommand_P(uint8_t param)
+{
+    uint8_t Param[16] = {0};
+    uint8_t parm_len = 0;
+    int8_t tx_power_default = 4;
+
+
+    pf_log_raw(atel_log_ctl.error_en, "test_bleCcommand_P cmd(0x%d)\r", param);
+
+    switch(param) {
+        case TX_LEVEL_P8: {
+            pf_log_raw(atel_log_ctl.io_protocol_en, "Not support in SIMBA project, the max Tx power is +4dBm\r");
+        }
+        break;
+        case TX_LEVEL_P4: {
+            tx_power_default = 4;  //+4dBm
+        }
+        break;
+        case TX_LEVEL_0: {
+            tx_power_default = 0;  //0dBm
+        }
+        break;
+        case TX_LEVEL_N4: {
+            tx_power_default = -4;  //-4dBm
+        }
+        break;
+        case TX_LEVEL_N8: {
+            tx_power_default = -8;  //-8dBm
+        }
+        break;
+        case TX_LEVEL_N12: {
+            tx_power_default = -12;  //-12dBm
+        }
+        break;
+        case TX_LEVEL_N16: {
+            tx_power_default = -16;  //-16dBm
+        }
+        break;
+        case TX_LEVEL_N20: {
+            tx_power_default = -20;  //-20dBm
+        }
+        break;
+		
+        default:
+        break;
+    }
+
+
+    if (pf_tx_power_set(tx_power_default) == NRF_SUCCESS)
+    {
+        if(param != TX_LEVEL_P8)
+        	tx_1m_rssi = tx_pwr_rssi[param].txRssi;
+        else
+		tx_1m_rssi = tx_pwr_rssi[TX_LEVEL_P4].txRssi;
+
+        advertising_data_update(beacon_adv_interval, beacon_adv_duration, 0);
+
+        pf_log_raw(atel_log_ctl.io_protocol_en, "TxPwr(%d, 0x%x)\r", tx_power_default, tx_1m_rssi);
+
+    }
+
+
+    Param[0] = 'p';
+    Param[1] = param;
+
+    parm_len += 2;
+
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, Param, parm_len);
+}
+
+void monet_bleCcommand_L(uint8_t** param, uint8_t *p_len)
+{
+    uint8_t Param[16] = {0};
+    uint8_t parm_len = 0;
+    char sn_string[20] = {0};
+
+    *param += 1;
+    *p_len -= 1;
+
+    Param[0] = 'l';
+    memcpy(Param + 1, *param, MODULE_SN_LENGTH);
+    parm_len += 9;
+
+    memcpy(m_sn_info, *param, MODULE_SN_LENGTH);
+
+    if(monet_data.bleAdvertiseStatus)
+       ble_aus_advertising_stop();
+	 
+    advertising_data_update(beacon_adv_interval, beacon_adv_duration, 0);
+
+    Hex2String(sn_string, m_sn_info, MODULE_SN_LENGTH);
+	
+    pf_log_raw(atel_log_ctl.io_protocol_en, "monet_bleCcommand_L cmd(sn: %s)\r", /*m_sn_info*/sn_string);
+
+    *param += 8;
+    *p_len -= 8;
+
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, Param, parm_len);
+}
+
+void monet_bleCcommand_Q(uint8_t** param, uint8_t *p_len)
+{
+    uint8_t Param[16] = {0};
+    uint8_t parm_len = 0;
+    uint32_t old_adv_interval;
+    uint16_t old_adv_duration;
+
+    *param += 1;
+    *p_len -= 1;
+
+    Param[0] = 'q';
+    Param[1] = (*param)[0];
+    Param[2] = (*param)[1];
+    Param[3] = (*param)[2];
+    Param[4] = (*param)[3];
+    Param[5] = (*param)[4];
+    Param[6] = (*param)[5];
+
+    parm_len += 7;
+
+    pf_log_raw(atel_log_ctl.io_protocol_en, "monet_bleCcommand_Q cmd(0x%x 0x%x 0x%x 0x%x)\r", (*param)[0], (*param)[1], (*param)[2], (*param)[3]);
+
+
+    old_adv_interval = beacon_adv_interval;
+    old_adv_duration = beacon_adv_duration;
+
+    beacon_adv_interval = (((*param)[3] << 24) + ((*param)[2] << 16) + ((*param)[1] << 8) + (*param)[0]);
+    beacon_adv_duration = (((*param)[5] << 8) + (*param)[4]);
+
+
+    if(monet_data.bleAdvertiseStatus)
+       ble_aus_advertising_stop();
+
+    pf_log_raw(atel_log_ctl.io_protocol_en, "(oldinterval: %d, oldduration: %d, interval: %d, duration: %d)\r", old_adv_interval, old_adv_duration, beacon_adv_interval, beacon_adv_duration);
+
+    //if(old_adv_interval != beacon_adv_interval  || (old_adv_duration != beacon_adv_duration))
+    advertising_data_update(beacon_adv_interval, beacon_adv_duration, 1);
+
+    *param += 6;
+    *p_len -= 6;
+
+    BuildFrame(IO_CMD_CHAR_BLE_CTRL, Param, parm_len);
+}
+
+
+void ble_inform_device_mac(void)
+{
+    uint8_t left_len = 16;
+    uint8_t *p_tmp = NULL;
+
+    monet_bleCcommand_m(&p_tmp, &left_len);
+}
+
+// void monet_bleCcommand_M(uint8_t** param, uint8_t *p_len)
+// {
+
+// }
+
+void monet_bleCcommand(uint8_t* pParam, uint8_t Length)
+{
+    uint8_t left_len = Length;
+    uint8_t *p_tmp = pParam;
+
+BLE_C_AGAIN:
+    switch (*p_tmp)
+    {
+        case 'm':
+        monet_bleCcommand_m(&p_tmp, &left_len);
+        break;
+    
+        // case 'M':
+        // monet_bleCcommand_M(&p_tmp, &left_len);
+        // break;
+
+        case 'D':
+        monet_bleCcommand_D(&p_tmp, &left_len);
+        break;
+
+        case 'Q':
+        monet_bleCcommand_Q(&p_tmp, &left_len);
+        break;
+		
+        case 'L':
+        monet_bleCcommand_L(&p_tmp, &left_len);
+        break;
+		
+        case 'A':
+        monet_bleCcommand_A(&p_tmp, &left_len);
+        break;
+
+        case 'P':
+        monet_bleCcommand_P(&p_tmp, &left_len);
+        break;
+
+        default:
+        pf_log_raw(atel_log_ctl.error_en, "monet_bleCcommand unknown cmd\r");
+        left_len = 0;
+        break;
+    }
+
+    if (left_len > 0)
+    {
+        goto BLE_C_AGAIN;
+    }
+}
+
+/* E: configure */
+void monet_Ecommand(uint8_t* pParam)
+{
+    uint8_t pin = pParam[0];
+    uint8_t status = pParam[1];
+    uint16_t timer = pParam[2]+(pParam[3]<<8);
+
+    pf_log_raw(atel_log_ctl.io_protocol_en, "monet_Ecommand pin(%d) status(0x%x) timer(%d)\r", pin, status, timer);
+
+    monet_conf.gConf[pin].Reload = (timer + TIME_UNIT - 1) / TIME_UNIT;
+    monet_conf.gConf[pin].status = status;
+    monet_gpio.counter[pin] = 0;
+    if(status&GPIO_INTO_MASK) {
+        if(monet_conf.IntPin != GPIO_TO_INDEX(GPIO_NONE)) {
+            monet_conf.gConf[monet_conf.IntPin].status &= (uint8_t)(~GPIO_INTO_MASK);
+        }
+        monet_conf.IntPin = pin;
+        monet_conf.gConf[pin].status |= GPIO_INTO_MASK;
+        monet_gpio.Intstatus= 0;
+    } else {
+        if(monet_conf.IntPin == pin) {
+            monet_conf.IntPin = GPIO_TO_INDEX(GPIO_NONE);
+            monet_gpio.Intstatus= 0;
+        }
+    }
+    if(status&GPIO_WD_MASK) {
+        if(monet_conf.WD.Pin != GPIO_TO_INDEX(GPIO_NONE)) {
+            monet_conf.gConf[monet_conf.WD.Pin].status &= (uint8_t)(~GPIO_WD_MASK);
+        }
+        monet_conf.WD.Pin = pin;
+    } else {
+        if(monet_conf.WD.Pin == pin)
+        {
+            monet_conf.WD.Pin = GPIO_TO_INDEX(GPIO_NONE);
+        }
+    }
+
+    configGPIO(pin, status);
+    if ((status & GPIO_DIRECTION) == DIRECTION_OUT) {
+        SetGPIOOutput(pin, (bool)((status&GPIO_SET_HIGH) >0));
+    } else {
+        GPIO_SET(pin, pf_gpio_read(pin));
+    }
+    // save_config();
+    pParam[1]= monet_conf.gConf[pin].status;
+    BuildFrame('e', pParam, 4);
+}
+
+void monet_Gcommand(uint8_t* pParam, uint8_t Length)
+{
+    uint8_t pin;
+    uint8_t x, y, z, s;
+
+    pin = pParam[0];
+    x = (uint8_t)(pParam[1] ? 1 : 0); // 1: Input 0: Output
+    y = (uint8_t)((monet_conf.gConf[pin].status & GPIO_MODE) ? 1 : 0);
+    z = (uint8_t)((monet_conf.gConf[pin].status & GPIO_OUTPUT_HIGH) ? 1 : 0);
+    s = (uint8_t)((pParam[2]) ? 1 : 0);
+
+    // WARNING: "G" command will set [pin].status bit0-bit3 to 0, so interrupt type will lose efficacy
+    monet_conf.gConf[pin].status = (uint8_t)(PIN_STATUS(x, y, z, s));
+    monet_gpio.counter[pin] = 0;
+    monet_conf.gConf[pin].Reload = 0;
+
+    configGPIO(pin, monet_conf.gConf[pin].status);
+    if ((monet_conf.gConf[pin].status & GPIO_DIRECTION) == DIRECTION_OUT)
+    {
+        SetGPIOOutput(pin, (bool)((uint8_t)pParam[2] > (uint8_t)0));
+    }
+
+    pParam[2] =  GPIO_GET(pin);
+
+    BuildFrame('g', pParam, 3);
+}
+
+void monet_Hcommand(uint8_t* pParamIn, uint8_t Length)
+{
+    uint8_t pParam[3] = {0};
+
+    monet_gpio.WDtimer = (pParamIn[0]);
+    pParam[0] = (uint8_t)((monet_gpio.WDtimer & 0x0000FF) >> 0);
+    pParam[1] = (uint8_t)((monet_gpio.WDtimer & 0x00FF00) >> 8);
+    pParam[2] = (uint8_t)((monet_gpio.WDtimer & 0xFF0000) >> 16);
+    BuildFrame('h', pParam, 3);
+    monet_conf.WD.Reload = monet_gpio.WDtimer;
+    // TODO: IRQ_OFF;
+    monet_gpio.WDflag = 1;
+    monet_data.devicePowerOnDelay = 0;
+    monet_data.devicePowerOffDelay = 0;
+    monet_data.SleepAlarm = 0;
+    turnOffDevice();
+    // TODO: IRQ_ON;
+}
+
+void monet_Icommand(void)
+{
+    uint8_t pParam[4];
+
+    pParam[0] = (uint8_t)(monet_gpio.Intstatus       & 0xFF);
+    pParam[1] = (uint8_t)((monet_gpio.Intstatus>>8)  & 0xFF);
+    pParam[2] = (uint8_t)((monet_gpio.Intstatus>>16) & 0xFF);
+    pParam[3] = (uint8_t)((monet_gpio.Intstatus>>24) & 0xFF);
+    monet_gpio.Intstatus = 0;
+    BuildFrame('i', pParam, 4);
+    eventIReadyFlag = true;
+
+    pf_log_raw(atel_log_ctl.io_protocol_en, ">>>>monet_Icommand\r");
+}
+
+void monet_jcommand(void) { // Added for Loader interface
+    monet_data.deviceBootEnterDelay = DEVICE_BOOT_ENTER_DELAY_MS;
+}
+
+void monet_Pcommand(uint8_t* pParam, uint8_t Length)
+{
+    switch(pParam[0]) {
+        case 0: {
+            turnOffDevice();
+        }
+        break;
+        case 1: {
+            turnOffDeviceCancel(1);
+        }
+        break;
+        case 2: {
+            turnOffDeviceCancel(0); // Cancel the power off forever
+        }
+        break;
+        default:
+        // Extract the power state config data
+        // ConfigPowerMasks(pParam, Length);
+        break;
+    }
+    BuildFrame('p', pParam, Length);
+}
+
+
+/*
+ * First Parameter Command
+ * 0x01: Read GPIO all
+ * 0x02: Read GPIO x
+ * 0x03: OneWireDisable
+ *
+ */
+void monet_Qcommand(uint8_t* pParam, uint8_t Length)
+{
+    uint8_t command, value;
+    uint8_t gpio;
+    uint8_t ReportData[4] = {0};
+    uint8_t size;
+
+    command = pParam[0];
+    size = 0;
+
+    ReportData[0] = command;
+    switch (command) {
+    case 0x01:
+        value = 0;
+        for (gpio = 0; gpio < MAX_EXT_GPIOS; gpio++)
+        {
+            value = (uint8_t)(value | (GPIO_GET(gpio) << gpio));
+        }
+        ReportData[1] = value;
+        size = 2;
+        break;
+    case 0x02:
+        gpio = pParam[1];
+        ReportData[1] = gpio;
+        ReportData[2] = monet_conf.gConf[gpio].status;
+        ReportData[3] = GPIO_GET(gpio);
+        size = 4;
+        break;
+    }
+    if (size) {
+        BuildFrame('q', &ReportData[0], size);
+    }
+}
+
+void monet_Vcommand(void)
+{
+    uint8_t pParm[5];
+
+    pParm[0] = APP_MAJOR;
+    pParm[1] = APP_MINOR;
+    pParm[2] = APP_REVISION;
+    pParm[3] = APP_BUILD;
+    pParm[4] = APP_BLE_VERSION;
+
+    BuildFrame('v', pParm, 5);
+}
+
+#define COMPONENT_LIST_SIMBA_BLE_MCU (2)
+
+/*
+ * Component List
+ * 0 Reserved
+ * 1 Simba MCU
+ * 2 Simba BLE MCU
+ * 3 SLP-01 MCU
+ * 4 Nala MCU
+ * 5 Nala MUX MCU
+ * 6 AC61 Nordic MCU
+ * 7 AC61 ESP32 MCU
+ * 
+ * Information Type List
+ * Mask  Bit  Information Type
+ * 0x01  0    Version
+ * 0x02  1    MAC Address
+ * 0x04  2    Hardware ID and Revision
+ */
+void monet_xAAcommand(uint8_t* pParam, uint8_t Length)
+{
+    uint8_t component = 0;
+    uint8_t type_mask = 0;
+    uint8_t i = 0, index = 0;
+    uint8_t pParm[64] = {0};
+
+    component = pParam[0];
+    type_mask = pParam[1];
+
+    pParm[0] = component;
+    pParm[1] = type_mask;
+    index += 2;
+
+    if (component != COMPONENT_LIST_SIMBA_BLE_MCU)
+    {
+        BuildFrame(0xAA, pParm, index);
+        pf_log_raw(atel_log_ctl.io_protocol_en, ">>>>monet_xAAcommand component invalid.\r");
+        return;
+    }
+
+    for (i = 0; i < 8; i++)
+    {
+        if (type_mask & (1 << i))
+        {
+            pParm[index] = i;
+            index++;
+
+            switch (i)
+            {
+                case 0:
+                    pParm[index] = 4;
+                    index++;
+                    pParm[index + 0] = APP_MAJOR;
+                    pParm[index + 1] = APP_MINOR;
+                    pParm[index + 2] = APP_REVISION;
+                    pParm[index + 3] = APP_BUILD;
+                    index += 4;
+                    break;
+
+                case 1:
+                    pParm[index] = 6;
+                    index++;
+                    pParm[index + 0] = monet_data.ble_mac_addr[0];
+                    pParm[index + 1] = monet_data.ble_mac_addr[1];
+                    pParm[index + 2] = monet_data.ble_mac_addr[2];
+                    pParm[index + 3] = monet_data.ble_mac_addr[3];
+                    pParm[index + 4] = monet_data.ble_mac_addr[4];
+                    pParm[index + 5] = monet_data.ble_mac_addr[5];
+                    index += 6;
+                break;
+
+                case 2:
+                    pParm[index] = 3;
+                    index++;
+                    pParm[index + 0] = 0;
+                    pParm[index + 1] = 0;
+                    pParm[index + 2] = 0;
+                    index += 3;
+                break;
+
+                default:
+                    BuildFrame(0xAA, pParm, index);
+                    pf_log_raw(atel_log_ctl.io_protocol_en, ">>>>monet_xAAcommand type invalid.\r");
+                    return;
+                    break;
+            }
+        }
+    }
+
+    BuildFrame(0xAA, pParm, index);
+}
+
+void HandleRxCommand(void)
+{
+    pf_print_mdm_uart_rx(monet_data.iorxframe.cmd, &monet_data.iorxframe.data[0], monet_data.iorxframe.length);
+
+    switch(monet_data.iorxframe.cmd) {
+    case IO_CMD_CHAR_BLE_CTRL:
+        monet_bleCcommand(&monet_data.iorxframe.data[0], monet_data.iorxframe.length);
+        break;
+    case 'E':
+        monet_Ecommand(&monet_data.iorxframe.data[0]);
+        break;
+    case 'G':
+        monet_Gcommand(&monet_data.iorxframe.data[0], monet_data.iorxframe.length);
+        break;
+    case 'H':
+        monet_Hcommand(&monet_data.iorxframe.data[0], monet_data.iorxframe.length);
+        break;
+    case 'I':
+        monet_Icommand();
+        break;
+    case 'j':
+        monet_jcommand();
+        break;
+    case 'P':
+        monet_Pcommand(&monet_data.iorxframe.data[0], monet_data.iorxframe.length);
+        break;
+    case 'Q':
+        monet_Qcommand(&monet_data.iorxframe.data[0], monet_data.iorxframe.length);
+        break;
+    case 'V':
+        monet_Vcommand();
+        break;
+    case 0xAA:
+        monet_xAAcommand(&monet_data.iorxframe.data[0], monet_data.iorxframe.length);
+        break;
+    default:
+        pf_log_raw(atel_log_ctl.error_en, "HandleRxCommand cmd(0x%x) not valid.\r", monet_data.iorxframe.cmd);
+        break;
+    }
+}
+

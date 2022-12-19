@@ -1,0 +1,46 @@
+#ifndef __CHARGER_PROCESS_H
+#define __CHARGER_PROCESS_H
+#ifdef __cplusplus
+ extern "C" {
+#endif
+
+#include "include.h"
+
+#define CHARGER_PROCESS_PERIOD_MS (1000)
+
+//#define VOL_LIMIT_S_CHG_MODE_SEL	11000	// Voltage limit for solar charging mode selection. Unit in mV
+#define VOL_LIMIT_S_CHG_MODE_SEL	3000	// Voltage limit for solar charging mode selection. Unit in mV
+#define MP2762A_INPUT_VOL_LIMIT_SOL		11000	// Unit in mV. Limit for solar charging
+
+#define FUNC_JUMP_POINT_0	0
+#define FUNC_JUMP_POINT_1	1
+#define FUNC_JUMP_POINT_2	2
+#define FUNC_JUMP_POINT_3	3
+#define FUNC_JUMP_POINT_4	4
+#define FUNC_JUMP_POINT_5	5
+#define FUNC_JUMP_POINT_6   6   //reserved
+
+#define BAT_VOL_LIMIT 8400.0        // Unit in mV
+#define CHG_CUR_LIMIT 200.0         // Unit in mA
+#define BAT_CHG_DONE_DUR_MAX 86400  // Unit in seconds. 24 hours
+#define BAT_CHG_DONE_DUR_LIMIT 3600 // Unit in seconds. 1 hours
+
+int32_t chip_temp_get(void);
+bool is_charger_power_on(void);
+void setChargerOff(void);
+void setChargerOn(void);
+bool no_external_power(void);
+bool only_solar_power(void);
+bool exist_main_power(void);
+uint8_t charger_exist_probe(void);
+void charger_process_periodically(uint32_t delta_ms);
+
+bool is_solar_vol_low(void);
+void solar_chg_mode_proc(void);
+void solar_chg_mode_select(uint8_t jump_point);
+void solar_chg_mode_check_proc(void);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* __CHARGER_PROCESS_H */

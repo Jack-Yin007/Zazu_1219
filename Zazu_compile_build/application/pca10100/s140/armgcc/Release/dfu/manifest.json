@@ -1,0 +1,8 @@
+{
+    "manifest": {
+        "application": {
+            "bin_file": "zazu-Atel-Generic-1.0.255.31.bin",
+            "dat_file": "zazu-Atel-Generic-1.0.255.31.dat"
+        }
+    }
+}

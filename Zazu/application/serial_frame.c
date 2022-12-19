@@ -1,0 +1,380 @@
+/*
+ *  serial_frame.c
+ *
+ *  Created on: Dec 29, 2020
+ *      Author: Yangjie Gu
+ */
+
+#include <string.h>
+#include "serial_frame.h"
+#include "user.h"
+
+// void HandleRxCommand(void)
+// {
+//     pf_print_mdm_uart_rx(rxframe.cmd, &rxframe.data[0], rxframe.length);
+//     switch(rxframe.cmd) {
+//     case 'E':
+//         monet_Ecommand(&rxframe.data[0]);
+//         break;
+//     }
+// }
+
+// Data format:
+// Length(byte):  1  1   1   LEN       1
+// Content:      '$' LEN CMD data_body 0x0D
+int8_t sf_get_command(sf_rx_frame_t* rx_frame, uint8_t byte)
+{
+    int8_t handle = 0;
+
+    switch(rx_frame->state)
+    {
+    case SF_WAIT_FOR_DOLLAR:
+        if(byte == '$')
+        {
+            rx_frame->state = SF_GET_FRAME_LENGTH;
+        }
+        break;
+    case SF_GET_FRAME_LENGTH:
+        #if SF_CMD_CHECKSUM
+		byte--;
+        #endif /* SF_CMD_CHECKSUM */
+        if (byte <= SF_MAX_COMMAND)
+        {
+            rx_frame->length = byte;
+            rx_frame->remaining = byte;
+            rx_frame->state = SF_GET_COMMAND;
+        }
+        else
+        {
+            rx_frame->state = SF_WAIT_FOR_DOLLAR;
+        }
+        break;
+    case SF_GET_COMMAND:
+        rx_frame->cmd = byte;
+        rx_frame->state = SF_GET_CARRIAGE_RETURN;
+        rx_frame->checksum = byte;
+        rx_frame->parmCount = 0;
+        break;
+    case SF_GET_CARRIAGE_RETURN:
+        rx_frame->checksum += byte;
+        if (rx_frame->remaining == 0)
+        {
+            #if SF_CMD_CHECKSUM
+			if (rx_frame->checksum == 0xFF)
+            {
+            #else
+			if (byte == 0x0D)
+            {
+            #endif /* SF_CMD_CHECKSUM */
+                handle = 1;
+            }
+            rx_frame->state = SF_WAIT_FOR_DOLLAR;
+        } else {
+            rx_frame->remaining--;
+            rx_frame->data[(rx_frame->parmCount)++] = byte;
+        }
+        break;
+    default:
+        rx_frame->state = SF_WAIT_FOR_DOLLAR;
+        break;
+    }
+
+    return handle;
+}
+
+int8_t sf_get_command_esp(sf_rx_frame_t* rx_frame, uint8_t byte)
+{
+    int8_t handle = 0;
+#if SF_CMD_ESCAPE
+    // Ensure protocol is resynced if un-escaped $ is revc'd
+    if (byte == '$')
+    {
+        // Clean up old data
+        memset(rx_frame, 0, sizeof(sf_rx_frame_t));
+        // Setup for new message
+        rx_frame->state = SF_WAIT_FOR_DOLLAR;
+        rx_frame->escape = SF_GET_NORMAL;
+    }
+
+    if (rx_frame->state == SF_WAIT_FOR_DOLLAR)
+    {
+        sf_get_command(rx_frame, byte);
+        rx_frame->escape = SF_GET_NORMAL;
+        return 0;
+    }
+
+    switch (rx_frame->escape)
+    {
+    case SF_GET_NORMAL:
+        if (byte == '!')
+        {
+            rx_frame->escape = SF_GET_ESCAPE;
+        }
+        else
+        {
+            handle = sf_get_command(rx_frame, byte);
+        }
+        break;
+    case SF_GET_ESCAPE:
+        rx_frame->escape = SF_GET_NORMAL;
+        if (byte == '0')
+        {
+            handle = sf_get_command(rx_frame, '$');
+        }
+        else if (byte == '1')
+        {
+            handle = sf_get_command(rx_frame, '!');
+        }
+        else
+        {
+            // Reset the state
+            rx_frame->state = SF_WAIT_FOR_DOLLAR;
+        }
+        break;
+    }
+
+    return handle;
+#else
+    return sf_get_command(rx_frame, byte);
+#endif /* SF_CMD_ESCAPE */
+}
+
+/* Frame Structure: <0x7E><0x7E>$<L><C><P><CKSM><CR><LF>
+ * <0x7E><0x7E> - Preamble
+ * $ - 0x24
+ * L - Length of <P>, 1 byte
+ * C - Command, 1 byte
+ * P - Parameters, <L> bytes
+ * <CKSM> - Checksum, 1 byte
+ * <CR> - 0x0D
+ * <LF> - 0x0A
+ *
+ * nSize - the size of parameters
+ */
+void sf_build_frame(ring_buffer_t *pQueue, uint8_t cmd, uint8_t * pParam, uint8_t nSize)
+{
+    uint8_t  i = 0;
+    uint8_t sum = 0;
+
+    if (ring_buffer_left_get(pQueue) < (nSize + 8))
+    {
+        // No room
+        return;
+    }
+
+    CRITICAL_REGION_ENTER();
+    // IRQ_OFF;
+    ring_buffer_in(pQueue, 0x7E);
+    ring_buffer_in(pQueue, 0x7E);
+    ring_buffer_in(pQueue, '$');
+
+#if SF_USE_CHECKSUM
+    #if SF_CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, nSize + 1);
+    #else
+    ring_buffer_in(pQueue, nSize + 1);
+    #endif /* SF_CMD_ESCAPE */
+#else
+    #if SF_CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, nSize);
+    #else
+    ring_buffer_in(pQueue, nSize);
+    #endif /* SF_CMD_ESCAPE */
+#endif /* SF_USE_CHECKSUM */
+
+    #if SF_CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, cmd);
+    #else
+    ring_buffer_in(pQueue, cmd);
+    #endif /* SF_CMD_ESCAPE */
+
+    sum = cmd;
+
+    for(i = 0; i < nSize; i++)
+    {
+        #if SF_CMD_ESCAPE
+        ring_buffer_in_escape(pQueue, pParam[i]);
+        #else
+        ring_buffer_in(pQueue, pParam[i]);
+        #endif /* SF_CMD_ESCAPE */
+
+        sum += pParam[i];
+    }
+
+#if SF_USE_CHECKSUM
+    #if SF_CMD_ESCAPE
+    ring_buffer_in_escape(pQueue, sum ^ 0xFF);
+    #else
+    ring_buffer_in(pQueue, sum ^ 0xFF);
+    #endif /* SF_CMD_ESCAPE */
+#endif /* SF_USE_CHECKSUM */
+
+    ring_buffer_in(pQueue, 0x0D);
+    ring_buffer_in(pQueue, 0x0A); // For easier readability when capturing wire logs
+    CRITICAL_REGION_EXIT();
+    // IRQ_ON;
+}
+
+int32_t sf_data_init(sf_control_block_t* p_sf_cb, sf_control_block_init_t* p_sf_cb_init)
+{
+    if ((p_sf_cb == NULL) || (p_sf_cb_init == NULL))
+    {
+        return -1;
+    }
+
+    memset(p_sf_cb, 0, sizeof(sf_control_block_t));
+
+    ring_buffer_init(&(p_sf_cb->tx_buf), p_sf_cb_init->p_tx_buf, p_sf_cb_init->tx_buf_size);
+
+    p_sf_cb->rx_data = p_sf_cb_init->rx_data;
+    p_sf_cb->rx_process = p_sf_cb_init->rx_process;
+    p_sf_cb->tx_handle = p_sf_cb_init->tx_handle;
+
+    return 0;
+}
+
+int32_t sf_data_process(sf_control_block_t* p_sf_cb)
+{
+    int32_t ret = 0;
+    uint32_t tx_buf_num = 0;
+
+    memset(p_sf_cb->rx_tmp_buf, 0, sizeof(p_sf_cb->rx_tmp_buf));
+    p_sf_cb->rx_tmp_len = SF_STEP_SIZE_BYTES;
+    ret = p_sf_cb->rx_data(p_sf_cb->rx_tmp_buf, &(p_sf_cb->rx_tmp_len));
+    if (ret == 0)
+    {
+        uint8_t i = 0;
+
+        while (p_sf_cb->rx_tmp_len)
+        {
+            if (sf_get_command_esp(&(p_sf_cb->rx_frame), p_sf_cb->rx_tmp_buf[i]))
+            {
+                ret = p_sf_cb->rx_process(p_sf_cb->rx_frame.cmd, p_sf_cb->rx_frame.data, p_sf_cb->rx_frame.length);
+                memset(p_sf_cb->rx_frame.data, 0, SF_MAX_COMMAND);
+                p_sf_cb->rx_frame.length = 0;
+                if (ret == 0)
+                {
+                }
+                else
+                {
+                    /* code */
+                }
+            }
+            i++;
+            p_sf_cb->rx_tmp_len--;
+        }
+    }
+    else
+    {
+        /* code */
+    }
+
+    tx_buf_num = ring_buffer_num_get(&(p_sf_cb->tx_buf));
+    if ((tx_buf_num > (SF_STEP_SIZE_BYTES / 2)) || (p_sf_cb->tx_wait_count > 5))
+    {
+        p_sf_cb->tx_tmp_len = ring_buffer_out_len(&(p_sf_cb->tx_buf), p_sf_cb->tx_tmp_buf, SF_STEP_SIZE_BYTES);
+        ret = p_sf_cb->tx_handle(p_sf_cb->tx_tmp_buf, p_sf_cb->tx_tmp_len);
+        if (ret == 0)
+        {
+            memset(p_sf_cb->tx_tmp_buf, 0, SF_STEP_SIZE_BYTES);
+            p_sf_cb->tx_tmp_len = 0;
+        }
+        else
+        {
+            CRITICAL_REGION_ENTER();
+            ring_buffer_in_len(&(p_sf_cb->tx_buf), p_sf_cb->tx_tmp_buf, p_sf_cb->tx_tmp_len);
+            CRITICAL_REGION_EXIT();
+        }
+
+        p_sf_cb->tx_wait_count = 0;
+    }
+    else
+    {
+        if (tx_buf_num)
+        {
+            p_sf_cb->tx_wait_count++;
+        }
+    }
+
+    return ret;
+}
+
+int32_t sf_data_send(sf_control_block_t* p_sf_cb, uint8_t cmd, uint8_t* p_data, uint32_t len)
+{
+    uint32_t tx_buf_left = 0;
+
+    if (p_sf_cb == NULL)
+    {
+        return -1;
+    }
+
+    tx_buf_left = ring_buffer_left_get(&(p_sf_cb->tx_buf));
+    if (tx_buf_left < (len + 8))
+    {
+        return -2;
+    }
+
+    sf_build_frame(&(p_sf_cb->tx_buf), cmd, p_data, len);
+
+    return 0;
+}
+
+#if SF_TEST_FUNCTIONALITIES_EN
+
+uint8_t tx_buf[512];
+sf_control_block_t sf_cb_test;
+
+int32_t sf_test_rx_data(uint8_t* p_data, uint32_t* p_len)
+{
+    return -1;
+}
+
+int32_t sf_test_rx_process(uint8_t cmd, uint8_t* p_data, uint32_t len)
+{
+    pf_log_raw(atel_log_ctl.platform_en, "sf_test_rx_process cmd: 0x%x len: %d.\r\n", cmd, len);
+    printf_hex_and_char(p_data, len);
+    return 0;
+}
+
+int32_t sf_test_tx_handle(uint8_t* p_data, uint32_t len)
+{
+    pf_log_raw(atel_log_ctl.platform_en, "sf_test_tx_handle\r\n");
+    printf_hex_and_char(p_data, len);
+    return 0;
+}
+
+void sf_frame_test_init(void)
+{
+    sf_control_block_init_t sf_cb_init_test = {0};
+
+    sf_cb_init_test.p_tx_buf = tx_buf;
+    sf_cb_init_test.tx_buf_size = sizeof(tx_buf);
+    sf_cb_init_test.rx_data = sf_test_rx_data;
+    sf_cb_init_test.rx_process = sf_test_rx_process;
+    sf_cb_init_test.tx_handle = sf_test_tx_handle;
+    sf_data_init(&sf_cb_test, &sf_cb_init_test);
+}
+
+void sf_frame_test_process(void)
+{
+    uint8_t buf[128] = {0};
+    uint32_t i = 0;
+    static uint32_t count = 0;
+
+    for (i = 0; i < sizeof(buf); i++)
+    {
+        buf[i] = i;
+    }
+
+    count++;
+    buf[0] = (count >> 24) & 0xff;
+    buf[1] = (count >> 16) & 0xff;
+    buf[2] = (count >> 8) & 0xff;
+    buf[3] = (count >> 0) & 0xff;
+
+    sf_data_send(&sf_cb_test, 0x01, buf, sizeof(buf));
+
+    sf_data_process(&sf_cb_test);
+}
+
+#endif /* SF_TEST_FUNCTIONALITIES_EN */
