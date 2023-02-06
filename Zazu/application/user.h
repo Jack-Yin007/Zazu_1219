@@ -551,7 +551,7 @@ extern device_reset_info_t reset_info;
 extern debug_tlv_info_t  debug_tlv_info;
 extern power_state_t     power_state;
 
-void InitApp(uint8_t first_run);         /* I/O and Peripheral Initialization */
+void InitApp(uint8_t alreay_init);         /* I/O and Peripheral Initialization */
 void io_tx_queue_init(void);
 
 void atel_timerTickHandler(uint32_t tickUnit_ms);

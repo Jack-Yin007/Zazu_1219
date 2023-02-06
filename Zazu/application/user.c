@@ -106,7 +106,7 @@ void charger_chip_detect(void)
 }
 
 // This function contians charger chip detection
-void power_on_condition_check(uint8_t first_run)
+void power_on_condition_check(uint8_t alreay_init)
 {
     uint16_t adc_bat = 0;
     uint16_t adc_vin = 0;
@@ -196,38 +196,6 @@ void power_on_condition_check(uint8_t first_run)
         {
             monet_data.batPowerSave = 0;
         }
-        // pf_log_raw(atel_log_ctl.core_en,
-        //            "Zazu Started: power save mode(%d).\r",
-        //            monet_data.batPowerSave);
-        // #endif /* DEVICE_POWER_KEY_SUPPORT */
-
-        // if (monet_data.mainPowerValid == 1)
-        // {
-        //     if (!first_run)
-        //     {
-        //         // pf_device_power_normal_indicate();
-        //         pf_log_raw(atel_log_ctl.core_en, "Zazu Started: Main power valid.\r");
-        //         // return;
-        //     }
-        //     // pf_device_power_normal_indicate();
-        //     // pf_log_raw(atel_log_ctl.core_en, "Zazu Started: Main power valid.\r");
-        //     // return;
-        // }
-
-        // if ((monet_data.batPowerValid == 1)
-        //     #if DEVICE_POWER_KEY_SUPPORT
-        //      && (reset_info.button_power_on == 1)
-        //     #endif /* DEVICE_POWER_KEY_SUPPORT */
-        //    )
-        // {
-        //     if (!first_run)
-        //     {
-        //         // pf_device_power_normal_indicate();
-        //         pf_log_raw(atel_log_ctl.core_en, "Zazu Started: Main power valid.\r");
-        //         // return;
-        //     }
-
-        // }
 
         pf_log_raw(atel_log_ctl.error_en,
                    "Power on fail: MainValid(%d) BatValid(%d) KeyValid(%d).\r",
@@ -326,7 +294,7 @@ void power_on_condition_check(uint8_t first_run)
 
         if (monet_data.mainPowerValid == 1)
         {
-            if (!first_run)
+            if (!alreay_init)
             {
                 pf_device_power_normal_indicate();
                 pf_log_raw(atel_log_ctl.core_en, "Zazu Started: Main power valid.\r");
@@ -343,7 +311,7 @@ void power_on_condition_check(uint8_t first_run)
             #endif /* DEVICE_POWER_KEY_SUPPORT */
            )
         {
-            if (!first_run)
+            if (!alreay_init)
             {
                 pf_device_power_normal_indicate();
                 pf_log_raw(atel_log_ctl.core_en, "Zazu Started: Bat and Key valid.\r");
@@ -372,16 +340,16 @@ void power_on_condition_check(uint8_t first_run)
     else
     {
         pf_gpio_write(GPIO_MCU_C, monet_data.mux_can);
-        if (!first_run)
+        if (!alreay_init)
         {
             pf_device_power_normal_indicate();
         }
     }
 }
 
-void InitApp(uint8_t first_run)
+void InitApp(uint8_t alreay_init)
 {
-    if (!first_run)
+    if (!alreay_init)
     {
         memset(&monet_data, 0, sizeof(monet_data));
     }
@@ -396,7 +364,7 @@ void InitApp(uint8_t first_run)
     init_config();
     gpio_init();
 
-    if (!first_run)
+    if (!alreay_init)
     {
         monet_data.ldr_enable_status = 0;
         monet_data.led_flash_enable = 0;
@@ -414,7 +382,7 @@ void InitApp(uint8_t first_run)
     monet_data.boot_revision =  (DFU_FLAG_REGISTER2 >>  16) & 0xff;
     monet_data.boot_build    =  (DFU_FLAG_REGISTER2 >>  24) & 0xff;
 
-    if (first_run == 0)
+    if (alreay_init == 0)
     {
         monet_data.batCriticalThresh = BUB_CRITICAL_THRESHOLD;  // Threshold MV
         monet_data.batLowThresh = BUB_LOW_THRESHOLD;   
@@ -424,13 +392,13 @@ void InitApp(uint8_t first_run)
     ble_connection_channel_init();
     #endif /* BLE_FUNCTION_ONOFF */
 
-    if (!first_run)
+    if (!alreay_init)
     {
         pf_adc_ready_timer_init();
         pf_gpio_pattern_timer_init();
     }
 
-    power_on_condition_check(first_run);
+    power_on_condition_check(alreay_init);
 
     // Init solar charger chip procedure
     if (monet_data.CANExistChargerNoExist == 0)
@@ -467,7 +435,7 @@ void InitApp(uint8_t first_run)
         // {
         //     solar_chg_mode_set(SOLAR_CHG_MODE2);
         // }
-        if (!first_run)
+        if (!alreay_init)
         {
             pf_timer_solar_chg_mode_init();
         }
@@ -483,7 +451,7 @@ void InitApp(uint8_t first_run)
         solar_chg_mode_select(FUNC_JUMP_POINT_0);
     }
 
-    if (!first_run)
+    if (!alreay_init)
     {
         device_button_pattern_init();
     }
@@ -509,7 +477,7 @@ void InitApp(uint8_t first_run)
     // Move to main()
     // pf_wdt_init();
 
-    if (!first_run)
+    if (!alreay_init)
     {
         monet_gpio.Intstatus |= MASK_FOR_BIT(INT_POWERUP); // Added power up flag to watch for Power up resets
     }
