@@ -1230,6 +1230,8 @@ void atel_timerTickHandler(uint32_t tickUnit_ms)
     uint8_t i, bDoReport=0;
     BitStatus  s;
     uint8_t count = 0;
+    uint16_t adc_bat = monet_data.AdcBackup;
+    uint16_t adc_bat_raw = monet_data.AdcBackupRaw;
 
     if (gTimer)
     {
@@ -1241,6 +1243,13 @@ void atel_timerTickHandler(uint32_t tickUnit_ms)
     }
 
     pf_wdt_kick();
+
+    pf_log_raw(atel_log_ctl.normal_en,"BUB(0x%x:%dMv) BATRaw(0x%x:%dMv) Baten(%d)\r",   //zazumcu-180 : add some logs
+                                    adc_bat,
+                                    (uint16_t)PF_ADC_RAW_TO_BATT_MV(adc_bat),
+                                    adc_bat_raw,
+                                    (uint16_t)PF_ADC_RAW_TO_BATT_MV(adc_bat_raw),
+                                    pf_gpio_read(GPIO_BAT_ADC_EN));
 
     for(i=0; i < NUM_OF_GPIO; i++) {
         if ((monet_conf.gConf[i].status & GPIO_DIRECTION) == DIRECTION_OUT) { //including watchdog timer
@@ -1516,11 +1525,11 @@ void atel_timer_s(uint32_t seconds)
                                         monet_data.batPowerCritical, 
                                         monet_data.mainPowerValid, 
                                         monet_data.batPowerSave);
-    pf_log_raw(atel_log_ctl.normal_en, "BatThresh Critical(%dMv) Low(%dMv) ModeDisable (%d) \r\n", 
+    pf_log_raw(atel_log_ctl.normal_en, "BatThresh Critical(%dMv) Low(%dMv) ModeDisable (%d) \r", 
                                         monet_data.batCriticalThresh,
                                         monet_data.batLowThresh,
                                         monet_data.charge_mode_disable);
-    pf_log_raw(atel_log_ctl.normal_en, "ChargeStatus(%d:%s) ChargeMode(%d) ChargeOn(%d) Mode2Disable (%d) Mode1Disable (%d) \r\n",
+    pf_log_raw(atel_log_ctl.normal_en, "ChargeStatus(%d:%s) ChargeMode(%d) ChargeOn(%d) Mode2Disable (%d) Mode1Disable (%d) \r",
                                         monet_data.charge_status,
                                         charge_status_string[monet_data.charge_status],
                                         solar_chg_mode_get(),
