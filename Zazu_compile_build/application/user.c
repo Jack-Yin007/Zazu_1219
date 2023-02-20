@@ -4734,6 +4734,11 @@ void monet_xAAcommand(uint8_t* pParam, uint8_t Length)
         return;
     }
 
+    if (count1sec < 15)
+    {
+        pf_log_raw(atel_log_ctl.io_protocol_en, ">>>>monet_xAAcommand esp32 not ready.\r")
+        return;
+    }
     // instance_id = pParam[1];
 
     // Bit 7 presents type_mask size: 1 for 4 byte; 0 for 1 byte
